@@ -101,7 +101,13 @@ def configured():
         "APPS_SCRIPT_URL", "API_SECRET", "ADMIN_EMAIL", "ADMIN_PIN"
     ])
 
-def api_call(action, table=None, rows=None, timeout=30):
+@st.cache_resource(show_spinner=False)
+def http_session():
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json"})
+    return session
+
+def api_call(action, table=None, rows=None, timeout=20):
     payload = {
         "secret": st.secrets["API_SECRET"],
         "action": action,
@@ -111,7 +117,7 @@ def api_call(action, table=None, rows=None, timeout=30):
     if rows is not None:
         payload["rows"] = rows
 
-    response = requests.post(
+    response = http_session().post(
         st.secrets["APPS_SCRIPT_URL"],
         json=payload,
         timeout=timeout,
@@ -123,8 +129,7 @@ def api_call(action, table=None, rows=None, timeout=30):
         raise RuntimeError(data.get("error", "Error de Apps Script"))
     return data
 
-def read_table(name):
-    rows = api_call("read", table=name)["data"]["rows"]
+def _normalize_table(name, rows):
     if not rows:
         return pd.DataFrame(columns=TABLES[name])
     df = pd.DataFrame(rows)
@@ -132,6 +137,21 @@ def read_table(name):
         if c not in df.columns:
             df[c] = ""
     return df[TABLES[name]].fillna("")
+
+@st.cache_data(ttl=12, show_spinner=False)
+def _read_table_cached(name):
+    rows = api_call("read", table=name)["data"]["rows"]
+    return _normalize_table(name, rows)
+
+def read_table(name, fresh=False):
+    if fresh:
+        rows = api_call("read", table=name)["data"]["rows"]
+        return _normalize_table(name, rows)
+    # Copy avoids one user/session mutating the cached dataframe object.
+    return _read_table_cached(name).copy()
+
+def invalidate_data_cache():
+    _read_table_cached.clear()
 
 def write_table(name, df):
     headers = TABLES[name]
@@ -141,6 +161,7 @@ def write_table(name, df):
             clean[c] = ""
     clean = clean[headers].fillna("").astype(str)
     api_call("replace", table=name, rows=clean.to_dict("records"))
+    invalidate_data_cache()
 
 def append_rows(name, rows):
     if not rows:
@@ -153,6 +174,7 @@ def append_rows(name, rows):
         else:
             prepared.append({h: str(v) for h, v in zip(headers, row)})
     api_call("append", table=name, rows=prepared)
+    invalidate_data_cache()
 
 def next_student_id(df):
     if df.empty:
@@ -181,22 +203,24 @@ def log_movement(before, after, movement_type, motivo="", observaciones="", usua
     ]
     append_rows("HistorialAcademico", [row])
 
+@st.cache_resource(show_spinner=False)
 def bootstrap():
+    # The structure is checked once per Streamlit process instead of on every click.
     api_call("init")
 
-    alumnos = read_table("Alumnos")
+    alumnos = read_table("Alumnos", fresh=True)
     if alumnos.empty:
         write_table("Alumnos", pd.DataFrame(SEED_ALUMNOS))
 
-    maestros = read_table("Maestros")
+    maestros = read_table("Maestros", fresh=True)
     if maestros.empty:
         write_table("Maestros", pd.DataFrame(SEED_MAESTROS, columns=TABLES["Maestros"]))
 
-    cursos = read_table("Cursos")
+    cursos = read_table("Cursos", fresh=True)
     if cursos.empty:
         write_table("Cursos", pd.DataFrame(SEED_CURSOS, columns=TABLES["Cursos"]))
 
-    usuarios = read_table("Usuarios")
+    usuarios = read_table("Usuarios", fresh=True)
     admin_email = normalize_email(st.secrets["ADMIN_EMAIL"])
     if usuarios.empty or admin_email not in usuarios["Email"].astype(str).str.lower().tolist():
         usuarios = pd.concat([usuarios, pd.DataFrame([{
@@ -209,6 +233,7 @@ def bootstrap():
             "Activo": "Sí",
         }])], ignore_index=True)
         write_table("Usuarios", usuarios)
+    return True
 
 def current_user():
     return st.session_state.get("user")
@@ -302,8 +327,8 @@ def public_registration_page():
             st.error("Debes confirmar la autorización para continuar.")
             return
 
-        alumnos = read_table("Alumnos")
-        usuarios = read_table("Usuarios")
+        alumnos = read_table("Alumnos", fresh=True)
+        usuarios = read_table("Usuarios", fresh=True)
 
         phone_norm = re.sub(r"\D","",celular)
         email_norm = normalize_email(email)
@@ -423,7 +448,7 @@ if "user" not in st.session_state:
         btn = st.form_submit_button("Ingresar", type="primary")
 
     if btn:
-        usuarios = read_table("Usuarios")
+        usuarios = read_table("Usuarios", fresh=True)
         usuarios["Email_norm"] = usuarios["Email"].astype(str).str.lower().str.strip()
         hit = usuarios[usuarios["Email_norm"] == normalize_email(email)]
         if hit.empty:
@@ -443,6 +468,9 @@ if "user" not in st.session_state:
 
 user = current_user()
 st.sidebar.success(f"{user['Nombre']} · {user['Rol']}")
+if st.sidebar.button("🔄 Actualizar datos", help="Fuerza una lectura inmediata de la base de datos"):
+    invalidate_data_cache()
+    st.rerun()
 if is_teacher() and user.get("Maestro"):
     st.sidebar.caption(f"Maestro: {user['Maestro']}")
 if is_student() and user.get("No_Control"):
