@@ -238,36 +238,60 @@ def bootstrap():
 def current_user():
     return st.session_state.get("user")
 
+def user_roles(user=None):
+    u = user or current_user()
+    if not u:
+        return []
+    raw = str(u.get("Rol", "")).strip()
+    roles = []
+    for part in re.split(r"[,;/|]+", raw):
+        role = part.strip()
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+def active_role():
+    roles = user_roles()
+    selected = st.session_state.get("active_role")
+    if selected in roles:
+        return selected
+    if "Administrador" in roles:
+        return "Administrador"
+    if "Maestro" in roles:
+        return "Maestro"
+    if roles:
+        return roles[0]
+    return ""
+
 def is_admin():
-    u = current_user()
-    return bool(u and u["Rol"] == "Administrador")
+    return active_role() == "Administrador"
 
 def is_teacher():
-    u = current_user()
-    return bool(u and u["Rol"] == "Maestro")
+    return active_role() == "Maestro"
 
 def is_student():
-    u = current_user()
-    return bool(u and u["Rol"] == "Alumno")
+    return active_role() == "Alumno"
 
 def logout():
     st.session_state.pop("user", None)
+    st.session_state.pop("active_role", None)
     st.rerun()
 
 def safe_student_scope(df):
-    """Aplica aislamiento de datos según el rol."""
+    """Aplica aislamiento de datos según el rol activo."""
     u = current_user()
+    role = active_role()
     if not u:
         return df.iloc[0:0]
 
-    if u["Rol"] == "Administrador" or u["Rol"] == "Consulta":
+    if role in ["Administrador", "Consulta"]:
         return df
 
-    if u["Rol"] == "Maestro":
+    if role == "Maestro":
         teacher = str(u.get("Maestro","")).strip()
         return df[df["Maestro"].astype(str) == teacher].copy()
 
-    if u["Rol"] == "Alumno":
+    if role == "Alumno":
         control = str(u.get("No_Control","")).strip()
         return df[df["No_Control"].astype(str) == control].copy()
 
@@ -460,6 +484,13 @@ if "user" not in st.session_state:
             elif check_pin(pin, row.get("PIN_Hash")):
                 row.pop("Email_norm", None)
                 st.session_state.user = row
+                roles = user_roles(row)
+                if "Administrador" in roles:
+                    st.session_state.active_role = "Administrador"
+                elif "Maestro" in roles:
+                    st.session_state.active_role = "Maestro"
+                elif roles:
+                    st.session_state.active_role = roles[0]
                 st.rerun()
             else:
                 st.error("PIN incorrecto.")
@@ -467,7 +498,18 @@ if "user" not in st.session_state:
     st.stop()
 
 user = current_user()
-st.sidebar.success(f"{user['Nombre']} · {user['Rol']}")
+roles = user_roles(user)
+if len(roles) > 1:
+    current = active_role()
+    idx = roles.index(current) if current in roles else 0
+    selected_role = st.sidebar.selectbox("Ver portal como", roles, index=idx, key="role_switcher")
+    if selected_role != active_role():
+        st.session_state.active_role = selected_role
+        st.rerun()
+elif roles:
+    st.session_state.active_role = roles[0]
+
+st.sidebar.success(f"{user['Nombre']} · {active_role()}")
 if st.sidebar.button("🔄 Actualizar datos", help="Fuerza una lectura inmediata de la base de datos"):
     invalidate_data_cache()
     st.rerun()
@@ -766,7 +808,7 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
 
     st.markdown('<div class="main-header">👨‍🏫 Maestros y Asignaciones</div>', unsafe_allow_html=True)
     tabs = st.tabs([
-        "Maestros","Reasignar alumnos","Nuevo alumno",
+        "Maestros","Promover alumno a maestro","Reasignar alumnos","Nuevo alumno",
         "Pendientes de asignación","Estados de alumnos"
     ])
 
@@ -805,6 +847,113 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
                 st.rerun()
 
     with tabs[1]:
+        st.subheader("Promover alumno a maestro")
+        st.caption("El alumno conserva su expediente y obtiene también el rol de Maestro. Después podrá cambiar entre vista Alumno y Maestro.")
+
+        alumnos = read_table("Alumnos", fresh=True)
+        usuarios = read_table("Usuarios", fresh=True)
+        maestros = read_table("Maestros", fresh=True)
+
+        alumno_options = {f"{r['No_Control']} · {r['Nombre']}": str(r["No_Control"]) for _, r in alumnos.iterrows()}
+        selected_label = st.selectbox("Alumno", list(alumno_options.keys()), key="promote_student") if alumno_options else None
+        red_default = ""
+        temp_pin = st.text_input("PIN temporal (solo se usa si el alumno todavía no tiene usuario)", type="password", key="promote_pin")
+
+        c1, c2 = st.columns(2)
+        promote = c1.button("⬆️ Promover a maestro", type="primary", use_container_width=True)
+        remove_teacher = c2.button("↩️ Quitar rol de maestro", use_container_width=True)
+
+        if selected_label:
+            sid = alumno_options[selected_label]
+            student_mask = alumnos["No_Control"].astype(str) == sid
+            student = alumnos[student_mask].iloc[0].to_dict()
+            student_name = str(student.get("Nombre", "")).strip()
+            student_email = normalize_email(student.get("Email", ""))
+
+            if promote:
+                # 1) Alta/activación en Maestros
+                teacher_match = maestros["Nombre"].astype(str).str.strip().str.lower() == student_name.lower()
+                if teacher_match.any():
+                    maestros.loc[teacher_match, "Activo"] = "Sí"
+                    if student_email:
+                        maestros.loc[teacher_match, "Email"] = student_email
+                    if str(student.get("Red", "")).strip():
+                        maestros.loc[teacher_match, "Red"] = str(student.get("Red", "")).strip()
+                else:
+                    nums = pd.to_numeric(maestros["ID_Maestro"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
+                    next_mid = int(nums.max()) + 1 if nums.notna().any() else len(maestros) + 1
+                    maestros = pd.concat([maestros, pd.DataFrame([{
+                        "ID_Maestro": f"M{next_mid:03d}",
+                        "Nombre": student_name,
+                        "Email": student_email,
+                        "Red": str(student.get("Red", "")).strip(),
+                        "Activo": "Sí",
+                    }])], ignore_index=True)
+                write_table("Maestros", maestros)
+
+                # 2) Actualizar usuario conservando Alumno + Maestro
+                user_mask = usuarios["No_Control"].astype(str) == sid
+                if not user_mask.any() and student_email:
+                    user_mask = usuarios["Email"].astype(str).str.lower().str.strip() == student_email
+
+                if user_mask.any():
+                    ui = usuarios[user_mask].index[0]
+                    roles_existing = [x.strip() for x in re.split(r"[,;/|]+", str(usuarios.at[ui, "Rol"])) if x.strip()]
+                    for role in ["Alumno", "Maestro"]:
+                        if role not in roles_existing:
+                            roles_existing.append(role)
+                    usuarios.at[ui, "Rol"] = ",".join(roles_existing)
+                    usuarios.at[ui, "Maestro"] = student_name
+                    usuarios.at[ui, "No_Control"] = sid
+                    usuarios.at[ui, "Activo"] = "Sí"
+                    if student_email:
+                        usuarios.at[ui, "Email"] = student_email
+                else:
+                    if not student_email:
+                        st.error("Este alumno no tiene correo. Agrégalo primero al expediente.")
+                        st.stop()
+                    if len(temp_pin) < 6:
+                        st.error("Este alumno no tiene usuario. Define un PIN temporal de al menos 6 caracteres.")
+                        st.stop()
+                    usuarios = pd.concat([usuarios, pd.DataFrame([{
+                        "Email": student_email,
+                        "Nombre": student_name,
+                        "Rol": "Alumno,Maestro",
+                        "Maestro": student_name,
+                        "No_Control": sid,
+                        "PIN_Hash": hash_pin(temp_pin),
+                        "Activo": "Sí",
+                    }])], ignore_index=True)
+                write_table("Usuarios", usuarios)
+                log_movement(student, student, "Promoción a maestro", "Alta de rol Maestro", "Conserva rol Alumno", user["Email"])
+                st.success(f"{student_name} ahora tiene roles Alumno y Maestro.")
+                st.rerun()
+
+            if remove_teacher:
+                user_mask = usuarios["No_Control"].astype(str) == sid
+                if not user_mask.any() and student_email:
+                    user_mask = usuarios["Email"].astype(str).str.lower().str.strip() == student_email
+                if user_mask.any():
+                    ui = usuarios[user_mask].index[0]
+                    roles_existing = [x.strip() for x in re.split(r"[,;/|]+", str(usuarios.at[ui, "Rol"])) if x.strip()]
+                    roles_existing = [r for r in roles_existing if r != "Maestro"]
+                    if "Alumno" not in roles_existing:
+                        roles_existing.insert(0, "Alumno")
+                    usuarios.at[ui, "Rol"] = ",".join(roles_existing)
+                    usuarios.at[ui, "Maestro"] = ""
+                    usuarios.at[ui, "No_Control"] = sid
+                    write_table("Usuarios", usuarios)
+
+                teacher_match = maestros["Nombre"].astype(str).str.strip().str.lower() == student_name.lower()
+                if teacher_match.any():
+                    maestros.loc[teacher_match, "Activo"] = "No"
+                    write_table("Maestros", maestros)
+
+                log_movement(student, student, "Baja de rol maestro", "Se retira rol Maestro", "Conserva rol Alumno", user["Email"])
+                st.success(f"Se retiró el rol Maestro de {student_name}; conserva su acceso como Alumno.")
+                st.rerun()
+
+    with tabs[2]:
         alumnos = read_table("Alumnos")
         maestros = read_table("Maestros")
         teacher_names = maestros[maestros["Activo"].apply(yes)]["Nombre"].astype(str).tolist()
@@ -851,7 +1000,7 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
                 st.success(f"Movimiento aplicado a {len(ids)} alumno(s).")
                 st.rerun()
 
-    with tabs[2]:
+    with tabs[3]:
         alumnos = read_table("Alumnos")
         maestros = read_table("Maestros")
         teacher_names = [""] + maestros[maestros["Activo"].apply(yes)]["Nombre"].astype(str).tolist()
@@ -885,7 +1034,7 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
             st.success(f"Alumno agregado con No. Control {nid}.")
             st.rerun()
 
-    with tabs[3]:
+    with tabs[4]:
         alumnos = read_table("Alumnos")
         pending = alumnos[alumnos["Estado_Alumno"].astype(str)=="Pendiente de asignación"]
         if pending.empty:
@@ -897,7 +1046,7 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
             )
         st.info("Enlace público: agrega **?registro=1** al final de la URL de tu app.")
 
-    with tabs[4]:
+    with tabs[5]:
         alumnos = read_table("Alumnos")
         estado = st.selectbox(
             "Filtrar por estado",
@@ -909,8 +1058,7 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
             use_container_width=True, hide_index=True
         )
 
-# =========================================================
-# ADMIN: USUARIOS Y PERMISOS
+# =========================================================# ADMIN: USUARIOS Y PERMISOS
 # =========================================================
 elif opcion == "🔐 Usuarios y Permisos":
     if not is_admin():
@@ -930,7 +1078,7 @@ elif opcion == "🔐 Usuarios y Permisos":
         st.subheader("Crear usuario")
         email = st.text_input("Correo")
         nombre = st.text_input("Nombre")
-        rol = st.selectbox("Rol", ["Maestro","Alumno","Consulta","Administrador"])
+        rol = st.selectbox("Rol", ["Alumno","Maestro","Alumno,Maestro","Consulta","Administrador"])
         maestro = st.selectbox("Vincular a maestro", teacher_names)
         alumno_ref = st.selectbox("Vincular a alumno", student_opts)
         pin = st.text_input("PIN inicial", type="password")
@@ -946,8 +1094,8 @@ elif opcion == "🔐 Usuarios y Permisos":
         else:
             usuarios = pd.concat([usuarios, pd.DataFrame([{
                 "Email":email_n,"Nombre":nombre.strip(),"Rol":rol,
-                "Maestro":maestro if rol=="Maestro" else "",
-                "No_Control":no_control if rol=="Alumno" else "",
+                "Maestro":maestro if "Maestro" in rol else "",
+                "No_Control":no_control if "Alumno" in rol else "",
                 "PIN_Hash":hash_pin(pin),"Activo":"Sí"
             }])], ignore_index=True)
             write_table("Usuarios", usuarios)
