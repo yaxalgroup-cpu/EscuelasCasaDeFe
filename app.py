@@ -582,6 +582,7 @@ elif is_teacher():
         "🏠 Mi grupo",
         "📝 Pase de Lista",
         "👤 Mis alumnos",
+        "➕ Alta y asignación de alumnos",
         "🎓 Material de mi módulo",
         "📜 Mi historial de asistencia",
     ]
@@ -1012,7 +1013,9 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
         st.subheader("📚 Asignación por curso")
         st.caption(
             "Selecciona primero el curso. Verás inmediatamente quién está asignado, "
-            "qué maestro tiene y podrás agregar, mover o cambiar alumnos sin editar Google Sheets."
+            "qué maestro tiene y podrás agregar, mover o cambiar alumnos sin editar Google Sheets. "
+            "Cada alumno mantiene una sola asignación vigente: al cambiarlo de maestro o curso, "
+            "desaparece automáticamente del grupo anterior."
         )
 
         alumnos = read_table("Alumnos")
@@ -1772,6 +1775,268 @@ elif opcion == "🎓 Cursos y Materiales":
                 st.success(
                     "✅ Reinicio completado. Cursos quedó vacío y los alumnos vigentes "
                     "quedaron pendientes de nueva asignación. Expedientes y avances intactos."
+                )
+                st.rerun()
+
+
+# =========================================================
+# MAESTRO: ALTA Y ASIGNACIÓN DE ALUMNOS
+# =========================================================
+elif opcion == "➕ Alta y asignación de alumnos":
+    if not is_teacher():
+        st.error("Acceso restringido.")
+        st.stop()
+
+    teacher_name = str(user.get("Maestro", "")).strip()
+    if not teacher_name:
+        st.error("Tu usuario de maestro no tiene un maestro vinculado.")
+        st.stop()
+
+    st.markdown('<div class="main-header">➕ Alta y asignación de alumnos</div>', unsafe_allow_html=True)
+    st.caption(
+        "Registra alumnos nuevos o asigna alumnos existentes a tus clases. "
+        "Cada alumno conserva una sola asignación vigente: si cambia de maestro o curso, "
+        "desaparece del grupo anterior y queda únicamente en la nueva asignación."
+    )
+
+    cursos = sync_course_catalog()
+    cursos_activos = cursos[cursos["Activo"].apply(yes)].copy()
+    course_names = [
+        x for x in cursos_activos["Nombre"].astype(str).str.strip().tolist()
+        if x
+    ]
+
+    if not course_names:
+        st.warning(
+            "No hay cursos activos. Coordinación debe crear al menos un curso "
+            "en Cursos y Materiales antes de que puedas asignar alumnos."
+        )
+        st.stop()
+
+    teacher_action = st.radio(
+        "Acción",
+        ["Registrar alumno nuevo", "Asignar alumno existente a mi clase"],
+        horizontal=True,
+        key="teacher_enrollment_action"
+    )
+
+    if teacher_action == "Registrar alumno nuevo":
+        st.subheader("🆕 Registrar alumno nuevo")
+
+        alumnos = read_table("Alumnos", fresh=True)
+        usuarios = read_table("Usuarios", fresh=True)
+
+        with st.form("teacher_new_student_form"):
+            nombre = st.text_input("Nombre completo *")
+            c1, c2, c3 = st.columns(3)
+            sexo = c1.selectbox("Sexo", ["", "Hombre", "Mujer", "Prefiero no indicar"])
+            celular = c2.text_input("Celular *")
+            email = c3.text_input("Correo electrónico *")
+
+            c4, c5, c6 = st.columns(3)
+            fecha_nac = c4.date_input(
+                "Fecha de nacimiento",
+                value=None,
+                min_value=dt.date(1940, 1, 1),
+                max_value=dt.date.today()
+            )
+            red = c5.selectbox(
+                "Red",
+                ["", "Matrimonios", "Jóvenes", "Prejuveniles", "Otro"]
+            )
+            curso = c6.selectbox("Curso *", course_names)
+
+            c7, c8 = st.columns(2)
+            modalidad = c7.selectbox("Modalidad *", ["PRESENCIAL", "ONLINE"])
+            pin = c8.text_input(
+                "PIN inicial *",
+                type="password",
+                help="Mínimo 6 caracteres. El alumno lo usará para entrar a su portal."
+            )
+
+            observ = st.text_area("Observación (opcional)")
+            submit = st.form_submit_button(
+                "Crear alumno y asignarlo a mi clase",
+                type="primary"
+            )
+
+        if submit:
+            email_n = normalize_email(email)
+            phone_norm = re.sub(r"\D", "", celular)
+
+            if not nombre.strip() or not celular.strip() or not email_n:
+                st.error("Nombre, celular y correo son obligatorios.")
+            elif len(pin) < 6:
+                st.error("El PIN debe tener al menos 6 caracteres.")
+            else:
+                dup_phone = (
+                    alumnos["Celular"].astype(str).str.replace(r"\D", "", regex=True)
+                    == phone_norm
+                )
+                dup_email = (
+                    alumnos["Email"].astype(str).str.lower().str.strip()
+                    == email_n
+                )
+                user_dup = (
+                    usuarios["Email"].astype(str).str.lower().str.strip()
+                    == email_n
+                )
+
+                if (dup_phone | dup_email).any():
+                    st.error("Ya existe un alumno con ese celular o correo.")
+                elif user_dup.any():
+                    st.error("Ese correo ya tiene un usuario registrado.")
+                else:
+                    nid = next_student_id(alumnos)
+
+                    student = {
+                        "No_Control": str(nid),
+                        "Nombre": nombre.strip(),
+                        "Sexo": sexo,
+                        "Fecha_Nacimiento": str(fecha_nac) if fecha_nac else "",
+                        "Celular": celular.strip(),
+                        "Email": email_n,
+                        "Red": red,
+                        "Maestro": teacher_name,
+                        "Modulo": curso,
+                        "Modalidad": modalidad,
+                        "Estado_Alumno": "Activo",
+                        "Fecha_Registro": str(dt.date.today()),
+                        "Origen_Registro": f"Alta por maestro: {teacher_name}",
+                        "Encuentro": "No",
+                        "Pasos12": "",
+                        "Liberacion": "No",
+                        "Esencia_B1": "",
+                        "Esencia_B2": "",
+                        "Esencia_B3": "",
+                        "Lanzamiento": "No",
+                        "Fechas_Eventos": observ.strip(),
+                        "Activo": "Sí",
+                    }
+
+                    alumnos = pd.concat(
+                        [alumnos, pd.DataFrame([student])],
+                        ignore_index=True
+                    )
+                    write_table("Alumnos", alumnos)
+
+                    new_user = {
+                        "Email": email_n,
+                        "Nombre": nombre.strip(),
+                        "Rol": "Alumno",
+                        "Maestro": "",
+                        "No_Control": str(nid),
+                        "PIN_Hash": hash_pin(pin),
+                        "Activo": "Sí",
+                    }
+                    usuarios = pd.concat(
+                        [usuarios, pd.DataFrame([new_user])],
+                        ignore_index=True
+                    )
+                    write_table("Usuarios", usuarios)
+
+                    log_movement(
+                        {},
+                        student,
+                        "Alta por maestro",
+                        f"Alta y asignación inicial al curso {curso}",
+                        observ.strip(),
+                        user["Email"]
+                    )
+
+                    st.success(
+                        f"✅ Alumno creado con No. Control {nid} y asignado a "
+                        f"{teacher_name} · {curso}."
+                    )
+                    st.rerun()
+
+    else:
+        st.subheader("🔄 Asignar alumno existente a mi clase")
+        st.warning(
+            "La nueva asignación sustituye la anterior. El expediente y el historial "
+            "NO se borran; únicamente cambia la asignación vigente."
+        )
+
+        alumnos = read_table("Alumnos", fresh=True)
+        elegibles = alumnos[academic_active_mask(alumnos)].copy()
+
+        options = {
+            f"{r['No_Control']} · {r['Nombre']} · "
+            f"{(str(r['Modulo']).strip() or 'Sin curso')} · "
+            f"{(str(r['Maestro']).strip() or 'Sin maestro')}":
+            str(r["No_Control"])
+            for _, r in elegibles.iterrows()
+        }
+
+        if not options:
+            st.info("No hay alumnos elegibles para asignación.")
+        else:
+            alumno_sel = st.selectbox(
+                "Alumno",
+                list(options.keys()),
+                key="teacher_existing_student"
+            )
+            curso_sel = st.selectbox(
+                "Curso",
+                course_names,
+                key="teacher_existing_course"
+            )
+            modalidad_sel = st.selectbox(
+                "Modalidad",
+                ["PRESENCIAL", "ONLINE"],
+                key="teacher_existing_mode"
+            )
+
+            sid = options[alumno_sel]
+            current_row = alumnos[
+                alumnos["No_Control"].astype(str) == sid
+            ].iloc[0]
+
+            st.info(
+                f"Asignación actual: "
+                f"**{current_row['Maestro'] or 'Sin maestro'}** · "
+                f"**{current_row['Modulo'] or 'Sin curso'}** · "
+                f"**{current_row['Modalidad'] or 'Sin modalidad'}**"
+            )
+
+            confirmar = st.checkbox(
+                "Confirmo que la nueva asignación reemplazará la asignación anterior.",
+                key="teacher_assignment_confirm"
+            )
+
+            if st.button(
+                "Asignar a mi clase",
+                type="primary",
+                disabled=not confirmar,
+                use_container_width=True,
+                key="teacher_assign_existing_btn"
+            ):
+                mask = alumnos["No_Control"].astype(str) == sid
+                before = alumnos[mask].iloc[0].to_dict()
+
+                alumnos.loc[mask, "Maestro"] = teacher_name
+                alumnos.loc[mask, "Modulo"] = curso_sel
+                alumnos.loc[mask, "Modalidad"] = modalidad_sel
+                alumnos.loc[mask, "Estado_Alumno"] = "Activo"
+                alumnos.loc[mask, "Activo"] = "Sí"
+
+                after = alumnos[mask].iloc[0].to_dict()
+
+                log_movement(
+                    before,
+                    after,
+                    "Asignación por maestro",
+                    f"Asignado por {teacher_name} al curso {curso_sel}",
+                    "La nueva asignación reemplaza la anterior y queda como única asignación vigente.",
+                    user["Email"]
+                )
+
+                write_table("Alumnos", alumnos)
+
+                st.success(
+                    f"✅ {after['Nombre']} quedó asignado a "
+                    f"{teacher_name} · {curso_sel}. "
+                    "Ya no aparecerá en el grupo anterior."
                 )
                 st.rerun()
 
