@@ -230,6 +230,14 @@ def next_student_id(df):
     nums = pd.to_numeric(df["No_Control"], errors="coerce")
     return int(nums.max()) + 1 if nums.notna().any() else 1
 
+def sync_course_catalog():
+    """
+    Catálogo maestro de cursos.
+    A partir de V3.0 SOLO la tabla Cursos define los nombres disponibles.
+    No se reimportan nombres antiguos desde Alumnos o Materiales.
+    """
+    return read_table("Cursos")
+
 def log_movement(before, after, movement_type, motivo="", observaciones="", usuario=""):
     row = [
         "MOV-" + uuid.uuid4().hex[:12].upper(),
@@ -299,6 +307,18 @@ def logout():
     st.session_state.pop("user", None)
     st.session_state.pop("active_role", None)
     st.rerun()
+
+def is_graduated_value(v):
+    return str(v or "").strip().casefold() == "graduado"
+
+def academic_active_mask(df):
+    """Alumnos vigentes para grupos, asignaciones y métricas académicas."""
+    if df.empty:
+        return pd.Series([], dtype=bool, index=df.index)
+    estado = df["Estado_Alumno"].astype(str).str.strip().str.casefold()
+    return df["Activo"].apply(yes) & ~estado.isin({
+        "graduado", "baja definitiva", "inactivo"
+    })
 
 def safe_student_scope(df):
     """Aplica aislamiento de datos según el rol activo."""
@@ -590,7 +610,7 @@ if opcion == "🏠 Inicio":
     maestros = read_table("Maestros")
     asist = read_table("Asistencias")
 
-    act = alumnos[alumnos["Activo"].apply(yes)] if not alumnos.empty else alumnos
+    act = alumnos[academic_active_mask(alumnos)] if not alumnos.empty else alumnos
     mact = maestros[maestros["Activo"].apply(yes)] if not maestros.empty else maestros
 
     c1,c2,c3,c4,c5 = st.columns(5)
@@ -616,7 +636,7 @@ if opcion == "🏠 Inicio":
 elif opcion == "🏠 Mi grupo":
     st.markdown('<div class="main-header">👨‍🏫 Mi grupo</div>', unsafe_allow_html=True)
     alumnos = safe_student_scope(read_table("Alumnos"))
-    alumnos = alumnos[alumnos["Activo"].apply(yes)]
+    alumnos = alumnos[academic_active_mask(alumnos)]
     st.metric("Alumnos asignados", len(alumnos))
     if alumnos.empty:
         st.info("No tienes alumnos asignados actualmente.")
@@ -664,7 +684,7 @@ elif opcion == "🏠 Mi perfil":
 elif opcion == "📝 Pase de Lista":
     st.markdown('<div class="main-header">📝 Pase de Lista</div>', unsafe_allow_html=True)
     alumnos = read_table("Alumnos")
-    alumnos = alumnos[alumnos["Activo"].apply(yes)].copy()
+    alumnos = alumnos[academic_active_mask(alumnos)].copy()
 
     if is_teacher():
         maestro_sel = str(user.get("Maestro","")).strip()
@@ -728,7 +748,7 @@ elif opcion in ["👤 Expedientes","👤 Mis alumnos"]:
 
     alumnos = safe_student_scope(read_table("Alumnos"))
     if is_teacher():
-        alumnos = alumnos[alumnos["Activo"].apply(yes)]
+        alumnos = alumnos[academic_active_mask(alumnos)]
 
     if alumnos.empty:
         st.info("No hay alumnos disponibles.")
@@ -764,7 +784,16 @@ elif opcion in ["👤 Expedientes","👤 Mis alumnos"]:
                 "Maestro", active_teachers,
                 index=active_teachers.index(str(a["Maestro"])) if str(a["Maestro"]) in active_teachers else 0
             )
-            modulo = c3.text_input("Módulo", value=str(a["Modulo"]))
+            cursos_ed = sync_course_catalog()
+            course_choices = [""] + cursos_ed[cursos_ed["Activo"].apply(yes)]["Nombre"].astype(str).tolist()
+            current_course = str(a["Modulo"]).strip()
+            if current_course and current_course not in course_choices:
+                course_choices.append(current_course)
+            modulo = c3.selectbox(
+                "Curso",
+                course_choices,
+                index=course_choices.index(current_course) if current_course in course_choices else 0
+            )
             modalidades = ["","PRESENCIAL","ONLINE"]
             modalidad = c1.selectbox(
                 "Modalidad", modalidades,
@@ -772,7 +801,7 @@ elif opcion in ["👤 Expedientes","👤 Mis alumnos"]:
             )
             estados = [
                 "Pendiente de asignación","Activo","Baja temporal","Inactivo",
-                "Baja definitiva","Reingreso","Reinicio de módulo"
+                "Baja definitiva","Reingreso","Reinicio de módulo","Graduado"
             ]
             estado_actual = str(a["Estado_Alumno"]) or "Activo"
             estado = c2.selectbox(
@@ -833,7 +862,7 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
     admin_section = st.radio(
         "Sección",
         ["Maestros","Promover alumno a maestro","Asignación por curso","Nuevo alumno",
-         "Pendientes de asignación","Estados de alumnos"],
+         "Pendientes de asignación","Egresados","Estados de alumnos"],
         horizontal=True,
         key="admin_teacher_section"
     )
@@ -988,43 +1017,32 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
 
         alumnos = read_table("Alumnos")
         maestros = read_table("Maestros")
-        materiales = read_table("Materiales")
+        cursos = sync_course_catalog()
 
         active_teachers = maestros[maestros["Activo"].apply(yes)].copy()
         teacher_names = active_teachers["Nombre"].astype(str).str.strip().tolist()
 
-        # Currícula base fija + cualquier módulo real que ya exista en la base/materiales.
-        curriculum_base = ["12 PASOS", "ESENCIA G8", "ESENCIA G9", "ESENCIA G10"]
+        cursos_activos = cursos[cursos["Activo"].apply(yes)].copy()
+        course_names = [
+            x for x in cursos_activos["Nombre"].astype(str).str.strip().tolist()
+            if x
+        ]
 
-        discovered = []
-        if not alumnos.empty:
-            discovered += [
-                x.strip() for x in alumnos["Modulo"].astype(str).tolist()
-                if x.strip() and x.strip().lower() not in {"sin asignar", "nan"}
-            ]
-        if not materiales.empty:
-            discovered += [
-                x.strip() for x in materiales["Modulo"].astype(str).tolist()
-                if x.strip() and x.strip().lower() not in {"sin asignar", "nan"}
-            ]
-
-        cursos_fijos = []
-        for x in curriculum_base + discovered:
-            if x and x not in cursos_fijos:
-                cursos_fijos.append(x)
-
-        if not cursos_fijos:
-            st.warning("No hay cursos configurados.")
+        if not course_names:
+            st.warning(
+                "No hay cursos activos. Crea uno en 🎓 Cursos y Materiales."
+            )
             st.stop()
 
         curso = st.selectbox(
-            "1. Selecciona el curso / módulo",
-            cursos_fijos,
+            "1. Selecciona el curso",
+            course_names,
             key="curso_asignacion_admin"
         )
 
         actuales = alumnos[
-            alumnos["Modulo"].astype(str).str.strip() == curso
+            (alumnos["Modulo"].astype(str).str.strip() == curso) &
+            academic_active_mask(alumnos)
         ].copy()
 
         st.markdown(f"### 👥 Alumnos actualmente en {curso}")
@@ -1032,18 +1050,19 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
             st.info("Este curso todavía no tiene alumnos asignados.")
         else:
             # Vista tipo tabla con acción rápida por alumno.
-            encabezados = st.columns([0.8, 2.3, 1.25, 1.15, 1.25, 1.25, 1.05])
+            encabezados = st.columns([0.65, 2.15, 1.1, 1.05, 1.05, 1.05, 1.0, 0.9])
             encabezados[0].markdown("**No.**")
             encabezados[1].markdown("**Nombre**")
             encabezados[2].markdown("**Maestro**")
             encabezados[3].markdown("**Modalidad**")
             encabezados[4].markdown("**Red**")
             encabezados[5].markdown("**Estado**")
-            encabezados[6].markdown("**Acción**")
+            encabezados[6].markdown("**Baja**")
+            encabezados[7].markdown("**Egreso**")
 
             for _, r in actuales.iterrows():
                 sid = str(r["No_Control"])
-                row_cols = st.columns([0.8, 2.3, 1.25, 1.15, 1.25, 1.25, 1.05])
+                row_cols = st.columns([0.65, 2.15, 1.1, 1.05, 1.05, 1.05, 1.0, 0.9])
                 row_cols[0].write(sid)
                 row_cols[1].write(str(r["Nombre"]))
                 row_cols[2].write(str(r["Maestro"]))
@@ -1052,14 +1071,13 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
                 row_cols[5].write(str(r["Estado_Alumno"]))
 
                 if row_cols[6].button(
-                    "Dar de baja",
+                    "Baja",
                     key=f"baja_curso_{curso}_{sid}",
-                    help="Quita al alumno de este curso sin borrar su expediente ni historial."
+                    help="Quita al alumno del curso, conservando expediente e historial."
                 ):
                     mask = alumnos["No_Control"].astype(str) == sid
                     before = alumnos[mask].iloc[0].to_dict()
 
-                    # Baja solo del curso: conserva expediente, usuario e historial.
                     alumnos.loc[mask, "Maestro"] = ""
                     alumnos.loc[mask, "Modulo"] = ""
                     alumnos.loc[mask, "Modalidad"] = ""
@@ -1067,21 +1085,37 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
                     alumnos.loc[mask, "Activo"] = "Sí"
 
                     after = alumnos[mask].iloc[0].to_dict()
-
                     log_movement(
-                        before,
-                        after,
-                        "Baja de curso",
+                        before, after, "Baja de curso",
                         f"Baja rápida del curso {curso}",
-                        "El alumno conserva expediente, historial y puede ser reasignado posteriormente.",
+                        "Conserva expediente, avances e historial.",
                         user["Email"]
                     )
                     write_table("Alumnos", alumnos)
+                    st.success(f"✅ {r['Nombre']} fue retirado de {curso}.")
+                    st.rerun()
 
-                    st.success(
-                        f"✅ {r['Nombre']} fue dado de baja de {curso}. "
-                        "Su expediente e historial se conservaron."
+                if row_cols[7].button(
+                    "Graduar",
+                    key=f"graduar_{curso}_{sid}",
+                    help="Marca al alumno como Graduado. Ya no aparecerá en pendientes, grupos ni nuevas asignaciones."
+                ):
+                    mask = alumnos["No_Control"].astype(str) == sid
+                    before = alumnos[mask].iloc[0].to_dict()
+
+                    alumnos.loc[mask, "Estado_Alumno"] = "Graduado"
+                    # Se conserva último maestro/módulo/modalidad como evidencia académica.
+                    alumnos.loc[mask, "Activo"] = "Sí"
+
+                    after = alumnos[mask].iloc[0].to_dict()
+                    log_movement(
+                        before, after, "Graduación",
+                        f"Graduado del curso {curso}",
+                        "Se conserva íntegro el expediente, avances y última asignación.",
+                        user["Email"]
                     )
+                    write_table("Alumnos", alumnos)
+                    st.success(f"🎓 {r['Nombre']} quedó registrado como Graduado.")
                     st.rerun()
 
             maestros_actuales = sorted([
@@ -1118,7 +1152,7 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
         st.markdown("### ➕ Agregar o mover alumnos a este curso")
 
         candidatos = alumnos[
-            alumnos["Activo"].apply(yes)
+            academic_active_mask(alumnos)
         ].copy()
 
         # Mostramos primero a quienes todavía no están en el curso.
@@ -1236,7 +1270,7 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
                 key=f"move_from_{curso}"
             )
 
-            destinos = [x for x in cursos_fijos if x != curso]
+            destinos = [x for x in course_names if x != curso]
             destino = st.selectbox(
                 "Curso destino",
                 destinos,
@@ -1331,7 +1365,10 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
 
     elif admin_section == "Pendientes de asignación":
         alumnos = read_table("Alumnos")
-        pending = alumnos[alumnos["Estado_Alumno"].astype(str)=="Pendiente de asignación"]
+        pending = alumnos[
+            (alumnos["Estado_Alumno"].astype(str) == "Pendiente de asignación") &
+            (~alumnos["Estado_Alumno"].astype(str).str.casefold().eq("graduado"))
+        ]
         if pending.empty:
             st.success("No hay alumnos pendientes.")
         else:
@@ -1339,13 +1376,51 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
                 pending[["No_Control","Nombre","Celular","Email","Red","Fecha_Registro"]],
                 use_container_width=True, hide_index=True
             )
-        st.info("Enlace público: agrega **?registro=1** al final de la URL de tu app.")
+        st.info("Los graduados nunca aparecen en esta lista.")
+
+    elif admin_section == "Egresados":
+        alumnos = read_table("Alumnos")
+        grad = alumnos[
+            alumnos["Estado_Alumno"].astype(str).str.strip().str.casefold() == "graduado"
+        ].copy()
+        st.subheader("🎓 Egresados")
+        st.caption("Conservan expediente, avances, historial y última asignación como evidencia.")
+        if grad.empty:
+            st.info("Aún no hay alumnos graduados.")
+        else:
+            st.dataframe(
+                grad[["No_Control","Nombre","Red","Maestro","Modulo","Modalidad","Estado_Alumno"]],
+                use_container_width=True, hide_index=True
+            )
+            opts = {
+                f"{r['No_Control']} · {r['Nombre']}": str(r["No_Control"])
+                for _, r in grad.iterrows()
+            }
+            restore = st.selectbox("Reactivar egresado (opcional)", [""] + list(opts.keys()))
+            if restore and st.button("↩️ Reactivar como pendiente"):
+                sid = opts[restore]
+                mask = alumnos["No_Control"].astype(str) == sid
+                before = alumnos[mask].iloc[0].to_dict()
+                alumnos.loc[mask, "Estado_Alumno"] = "Pendiente de asignación"
+                alumnos.loc[mask, "Maestro"] = ""
+                alumnos.loc[mask, "Modulo"] = ""
+                alumnos.loc[mask, "Modalidad"] = ""
+                alumnos.loc[mask, "Activo"] = "Sí"
+                after = alumnos[mask].iloc[0].to_dict()
+                log_movement(
+                    before, after, "Reactivación de egresado",
+                    "Reingreso académico", "", user["Email"]
+                )
+                write_table("Alumnos", alumnos)
+                st.success("Alumno reactivado como pendiente de asignación.")
+                st.rerun()
 
     elif admin_section == "Estados de alumnos":
         alumnos = read_table("Alumnos")
         estado = st.selectbox(
             "Filtrar por estado",
-            ["Todos","Activo","Pendiente de asignación","Baja temporal","Inactivo","Baja definitiva","Reingreso","Reinicio de módulo"]
+            ["Todos","Activo","Pendiente de asignación","Baja temporal","Inactivo",
+             "Baja definitiva","Reingreso","Reinicio de módulo","Graduado"]
         )
         view = alumnos if estado=="Todos" else alumnos[alumnos["Estado_Alumno"].astype(str)==estado]
         st.dataframe(
@@ -1353,7 +1428,8 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
             use_container_width=True, hide_index=True
         )
 
-# =========================================================# ADMIN: USUARIOS Y PERMISOS
+# =========================================================
+# ADMIN: USUARIOS Y PERMISOS
 # =========================================================
 elif opcion == "🔐 Usuarios y Permisos":
     if not is_admin():
@@ -1417,19 +1493,20 @@ elif opcion == "🔐 Usuarios y Permisos":
 # =========================================================
 elif opcion == "🎓 Cursos y Materiales":
     st.markdown('<div class="main-header">🎓 Cursos y Materiales</div>', unsafe_allow_html=True)
-    cursos = read_table("Cursos")
+
+    cursos = sync_course_catalog()
     materiales = read_table("Materiales")
-    active = cursos[cursos["Activo"].apply(yes)]
+    active = cursos[cursos["Activo"].apply(yes)].copy()
 
     if not active.empty:
         cmap = dict(zip(active["Nombre"].astype(str), active["Curso_ID"].astype(str)))
-        cname = st.selectbox("Curso", list(cmap.keys()))
+        cname = st.selectbox("Curso", list(cmap.keys()), key="course_view_selector")
         cid = cmap[cname]
         mats = materiales[
-            (materiales["Curso_ID"].astype(str)==cid) &
+            (materiales["Curso_ID"].astype(str) == cid) &
             (materiales["Visible"].apply(yes))
         ]
-        for _,m in mats.iterrows():
+        for _, m in mats.iterrows():
             st.markdown(
                 f"""<div class="card"><b>{m['Modulo']} · {m['Titulo']}</b><br>
                 <span class="small-muted">{m['Descripcion']}</span><br><br>
@@ -1437,48 +1514,265 @@ elif opcion == "🎓 Cursos y Materiales":
                 unsafe_allow_html=True
             )
         if mats.empty:
-            st.info("Aún no hay materiales visibles.")
+            st.info("Aún no hay materiales visibles para este curso.")
+    else:
+        st.info("No hay cursos activos.")
 
     if is_admin():
         st.divider()
         course_admin_section = st.radio(
-            "Administrar", ["Nuevo curso","Agregar material"],
-            horizontal=True, key="course_admin_section"
+            "Administrar",
+            ["Administrar cursos", "Nuevo curso", "Agregar material", "Reinicio académico"],
+            horizontal=True,
+            key="course_admin_section"
         )
-        if course_admin_section == "Nuevo curso":
+
+        if course_admin_section == "Administrar cursos":
+            cursos = sync_course_catalog()
+
+            if cursos.empty:
+                st.info("Aún no hay cursos registrados.")
+            else:
+                st.dataframe(
+                    cursos[["Curso_ID", "Nombre", "Descripcion", "Activo"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                selected_id = st.selectbox(
+                    "Curso a editar",
+                    cursos["Curso_ID"].astype(str).tolist(),
+                    format_func=lambda cid: (
+                        f"{cid} · " +
+                        str(cursos.loc[
+                            cursos["Curso_ID"].astype(str) == cid, "Nombre"
+                        ].iloc[0])
+                    ),
+                    key="edit_course_id"
+                )
+
+                edit_row = cursos[
+                    cursos["Curso_ID"].astype(str) == selected_id
+                ].iloc[0]
+
+                with st.form("edit_course_form"):
+                    new_name = st.text_input(
+                        "Nombre del curso",
+                        value=str(edit_row["Nombre"])
+                    )
+                    new_desc = st.text_area(
+                        "Descripción",
+                        value=str(edit_row["Descripcion"])
+                    )
+                    new_status = st.radio(
+                        "Estado",
+                        ["Activo", "Inactivo"],
+                        index=0 if yes(edit_row["Activo"]) else 1,
+                        horizontal=True
+                    )
+                    save_edit = st.form_submit_button(
+                        "💾 Guardar cambios",
+                        type="primary"
+                    )
+
+                if save_edit:
+                    old_name = str(edit_row["Nombre"]).strip()
+                    clean_name = new_name.strip()
+
+                    if not clean_name:
+                        st.error("El nombre del curso no puede quedar vacío.")
+                    else:
+                        duplicates = cursos[
+                            (cursos["Nombre"].astype(str).str.strip().str.casefold()
+                             == clean_name.casefold()) &
+                            (cursos["Curso_ID"].astype(str) != selected_id)
+                        ]
+                        if not duplicates.empty:
+                            st.error("Ya existe otro curso con ese nombre.")
+                        else:
+                            mask_c = cursos["Curso_ID"].astype(str) == selected_id
+                            cursos.loc[mask_c, "Nombre"] = clean_name
+                            cursos.loc[mask_c, "Descripcion"] = new_desc.strip()
+                            cursos.loc[mask_c, "Activo"] = (
+                                "Sí" if new_status == "Activo" else "No"
+                            )
+
+                            # Si cambia el nombre, actualizamos también las referencias.
+                            if clean_name != old_name:
+                                alumnos_edit = read_table("Alumnos")
+                                mask_a = (
+                                    alumnos_edit["Modulo"].astype(str).str.strip()
+                                    == old_name
+                                )
+                                if mask_a.any():
+                                    alumnos_edit.loc[mask_a, "Modulo"] = clean_name
+                                    write_table("Alumnos", alumnos_edit)
+
+                                materiales_edit = read_table("Materiales")
+                                mask_m = (
+                                    materiales_edit["Curso_ID"].astype(str)
+                                    == selected_id
+                                ) | (
+                                    materiales_edit["Modulo"].astype(str).str.strip()
+                                    == old_name
+                                )
+                                if mask_m.any():
+                                    materiales_edit.loc[mask_m, "Modulo"] = clean_name
+                                    write_table("Materiales", materiales_edit)
+
+                            write_table("Cursos", cursos)
+                            st.success(
+                                "✅ Curso actualizado. El nuevo nombre quedó vinculado "
+                                "a asignaciones y materiales."
+                            )
+                            st.rerun()
+
+        elif course_admin_section == "Nuevo curso":
+            cursos = sync_course_catalog()
+
             with st.form("new_course"):
                 name = st.text_input("Nombre del curso")
                 desc = st.text_area("Descripción")
                 save = st.form_submit_button("Crear curso", type="primary")
+
             if save:
-                cid = f"C{len(cursos)+1:03d}"
-                cursos = pd.concat([cursos,pd.DataFrame([{
-                    "Curso_ID":cid,"Nombre":name.strip(),"Descripcion":desc.strip(),"Activo":"Sí"
-                }])], ignore_index=True)
-                write_table("Cursos", cursos)
-                st.success("Curso creado.")
-                st.rerun()
+                clean_name = name.strip()
+                if not clean_name:
+                    st.error("Escribe el nombre del curso.")
+                elif (
+                    cursos["Nombre"].astype(str).str.strip().str.casefold()
+                    == clean_name.casefold()
+                ).any():
+                    st.error("Ya existe un curso con ese nombre.")
+                else:
+                    cid = "C-" + uuid.uuid4().hex[:8].upper()
+
+                    cursos = pd.concat([cursos, pd.DataFrame([{
+                        "Curso_ID": cid,
+                        "Nombre": clean_name,
+                        "Descripcion": desc.strip(),
+                        "Activo": "Sí"
+                    }])], ignore_index=True)
+
+                    write_table("Cursos", cursos)
+                    st.success(
+                        f"✅ Curso '{clean_name}' creado. Ya aparece en "
+                        "Maestros y Asignaciones → Asignación por curso."
+                    )
+                    st.rerun()
+
         elif course_admin_section == "Agregar material":
-            cursos = read_table("Cursos")
-            cmap = dict(zip(cursos["Nombre"].astype(str), cursos["Curso_ID"].astype(str)))
-            with st.form("new_material"):
-                cname = st.selectbox("Curso", list(cmap.keys()))
-                modulo = st.text_input("Módulo / Unidad")
-                title = st.text_input("Título")
-                desc = st.text_area("Descripción")
-                url = st.text_input("Enlace de Google Drive / recurso")
-                tipo = st.selectbox("Tipo", ["PDF","Documento","Video","Presentación","Otro"])
-                visible = st.checkbox("Visible", value=True)
-                save = st.form_submit_button("Agregar material", type="primary")
-            if save:
-                mid = f"MAT{len(materiales)+1:04d}"
-                materiales = pd.concat([materiales,pd.DataFrame([{
-                    "Material_ID":mid,"Curso_ID":cmap[cname],"Modulo":modulo.strip(),
-                    "Titulo":title.strip(),"Descripcion":desc.strip(),"URL":url.strip(),
-                    "Tipo":tipo,"Fecha":str(dt.date.today()),"Visible":"Sí" if visible else "No"
-                }])], ignore_index=True)
-                write_table("Materiales", materiales)
-                st.success("Material agregado.")
+            cursos = sync_course_catalog()
+            cursos_activos = cursos[cursos["Activo"].apply(yes)].copy()
+            cmap = dict(zip(
+                cursos_activos["Nombre"].astype(str),
+                cursos_activos["Curso_ID"].astype(str)
+            ))
+
+            if not cmap:
+                st.info("Primero crea o activa un curso.")
+            else:
+                with st.form("new_material"):
+                    cname = st.selectbox("Curso", list(cmap.keys()))
+                    title = st.text_input("Título")
+                    desc = st.text_area("Descripción")
+                    url = st.text_input("Enlace de Google Drive / recurso")
+                    tipo = st.selectbox(
+                        "Tipo",
+                        ["PDF", "Documento", "Video", "Presentación", "Otro"]
+                    )
+                    visible = st.checkbox("Visible", value=True)
+                    save = st.form_submit_button(
+                        "Agregar material",
+                        type="primary"
+                    )
+
+                if save:
+                    mid = f"MAT{len(materiales)+1:04d}"
+                    materiales = pd.concat([materiales, pd.DataFrame([{
+                        "Material_ID": mid,
+                        "Curso_ID": cmap[cname],
+                        "Modulo": cname,
+                        "Titulo": title.strip(),
+                        "Descripcion": desc.strip(),
+                        "URL": url.strip(),
+                        "Tipo": tipo,
+                        "Fecha": str(dt.date.today()),
+                        "Visible": "Sí" if visible else "No"
+                    }])], ignore_index=True)
+
+                    write_table("Materiales", materiales)
+                    st.success("Material agregado.")
+                    st.rerun()
+
+
+        elif course_admin_section == "Reinicio académico":
+            st.subheader("🧹 Reiniciar estructura académica")
+            st.warning(
+                "Esta acción deja el catálogo de cursos vacío y quita las asignaciones "
+                "actuales de maestro/curso/modalidad para comenzar desde cero. "
+                "NO borra alumnos, usuarios, asistencias, historial ni avances del expediente "
+                "(Encuentro, 12 Pasos, Liberación, Esencia, Lanzamiento, etc.)."
+            )
+            st.info(
+                "Los alumnos Graduados se conservan como egresados y no se modifican."
+            )
+
+            confirm = st.checkbox(
+                "Confirmo que deseo reiniciar cursos y asignaciones actuales",
+                key="confirm_academic_reset"
+            )
+            confirm_text = st.text_input(
+                'Escribe REINICIAR para habilitar el botón',
+                key="academic_reset_text"
+            )
+
+            if st.button(
+                "🧹 Reiniciar cursos y asignaciones",
+                type="primary",
+                disabled=not (confirm and confirm_text.strip().upper() == "REINICIAR"),
+                key="academic_reset_button"
+            ):
+                alumnos_reset = read_table("Alumnos", fresh=True)
+                cursos_reset = read_table("Cursos", fresh=True)
+
+                # Guardar evidencia de cada asignación que se elimina.
+                for _, rr in alumnos_reset.iterrows():
+                    if is_graduated_value(rr.get("Estado_Alumno", "")):
+                        continue
+                    had_assignment = any([
+                        str(rr.get("Maestro", "")).strip(),
+                        str(rr.get("Modulo", "")).strip(),
+                        str(rr.get("Modalidad", "")).strip(),
+                    ])
+                    if had_assignment:
+                        before = rr.to_dict()
+                        sid = str(rr["No_Control"])
+                        mask = alumnos_reset["No_Control"].astype(str) == sid
+                        alumnos_reset.loc[mask, "Maestro"] = ""
+                        alumnos_reset.loc[mask, "Modulo"] = ""
+                        alumnos_reset.loc[mask, "Modalidad"] = ""
+                        alumnos_reset.loc[mask, "Estado_Alumno"] = "Pendiente de asignación"
+                        alumnos_reset.loc[mask, "Activo"] = "Sí"
+                        after = alumnos_reset[mask].iloc[0].to_dict()
+                        log_movement(
+                            before, after, "Reinicio académico",
+                            "Limpieza de cursos y asignaciones para nueva configuración",
+                            "Se conservaron íntegramente los avances académicos del expediente.",
+                            user["Email"]
+                        )
+
+                write_table("Alumnos", alumnos_reset)
+
+                # Vaciar SOLO catálogo de cursos. Materiales históricos se conservan
+                # como evidencia, pero no reaparecen porque Cursos es la única fuente.
+                empty_courses = pd.DataFrame(columns=TABLES["Cursos"])
+                write_table("Cursos", empty_courses)
+
+                st.success(
+                    "✅ Reinicio completado. Cursos quedó vacío y los alumnos vigentes "
+                    "quedaron pendientes de nueva asignación. Expedientes y avances intactos."
+                )
                 st.rerun()
 
 # =========================================================
