@@ -1,3 +1,1410 @@
+
+import streamlit as st
+import pandas as pd
+import datetime as dt
+import hashlib
+import re
+import uuid
+import time
+
+import requests
+
+st.set_page_config(
+    page_title="Casa de Fe Mérida - Escuelas",
+    page_icon="⛪",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+.main-header {font-size:2.1rem;color:#1E3A8A;font-weight:800;margin-bottom:.2rem}
+.sub-header {font-size:1rem;color:#64748B;margin-bottom:1.2rem}
+.card {background:#F8FAFC;border:1px solid #E2E8F0;border-left:5px solid #1E3A8A;
+       padding:1rem;border-radius:12px;margin-bottom:1rem}
+.small-muted {color:#64748B;font-size:.9rem}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# ESQUEMA DE BASE DE DATOS
+# =========================================================
+TABLES = {
+    "Alumnos": [
+        "No_Control","Nombre","Sexo","Fecha_Nacimiento","Celular","Email","Red",
+        "Maestro","Modulo","Modalidad","Estado_Alumno","Fecha_Registro","Origen_Registro",
+        "Encuentro","Pasos12","Liberacion","Esencia_B1","Esencia_B2","Esencia_B3",
+        "Lanzamiento","Fechas_Eventos","Activo"
+    ],
+    "Asistencias": [
+        "Timestamp","Fecha","Maestro","Modulo","No_Control","Alumno",
+        "Asistencia","Observaciones","Capturado_Por"
+    ],
+    "Maestros": ["ID_Maestro","Nombre","Email","Red","Activo"],
+    "Usuarios": [
+        "Email","Nombre","Rol","Maestro","No_Control","PIN_Hash","Activo"
+    ],
+    "Cursos": ["Curso_ID","Nombre","Descripcion","Activo"],
+    "Materiales": [
+        "Material_ID","Curso_ID","Modulo","Titulo","Descripcion",
+        "URL","Tipo","Fecha","Visible"
+    ],
+    "HistorialAcademico": [
+        "Movimiento_ID","Timestamp","No_Control","Alumno","Tipo_Movimiento",
+        "Estado_Anterior","Estado_Nuevo","Maestro_Anterior","Maestro_Nuevo",
+        "Modulo_Anterior","Modulo_Nuevo","Modalidad_Anterior","Modalidad_Nueva",
+        "Motivo","Observaciones","Usuario"
+    ],
+}
+
+SEED_MAESTROS = [
+    ["M001","Pastor","","Matrimonios","Sí"],
+    ["M002","Pastora","","Matrimonios","Sí"],
+    ["M003","Perla","","","Sí"],
+    ["M004","Reina","","","Sí"],
+]
+
+SEED_CURSOS = [
+    ["C001","12 PASOS","Programa de formación 12 Pasos","Sí"],
+    ["C002","ESENCIA","Programa Esencia","Sí"],
+]
+
+# Base inicial mínima. Si ya tienes alumnos en Google Sheets, se conserva lo existente.
+SEED_ALUMNOS = [
+    {
+        "No_Control":"1","Nombre":"Abraham yañez","Sexo":"Hombre","Fecha_Nacimiento":"",
+        "Celular":"9993616494","Email":"","Red":"Matrimonios","Maestro":"Perla",
+        "Modulo":"ESENCIA G8","Modalidad":"ONLINE","Estado_Alumno":"Activo",
+        "Fecha_Registro":str(dt.date.today()),"Origen_Registro":"Carga inicial",
+        "Encuentro":"Si","Pasos12":"Clase 1-6","Liberacion":"Listo",
+        "Esencia_B1":"Clase 1-6","Esencia_B2":"Clase 1-6","Esencia_B3":"",
+        "Lanzamiento":"Si","Fechas_Eventos":"","Activo":"Sí"
+    }
+]
+
+# =========================================================
+# UTILIDADES GENERALES
+# =========================================================
+def yes(v):
+    return str(v).strip().lower() in {"sí","si","true","1","activo","yes"}
+
+def normalize_email(v):
+    return str(v or "").strip().lower()
+
+def hash_pin(pin):
+    return hashlib.sha256(str(pin).encode("utf-8")).hexdigest()
+
+def check_pin(pin, hashed):
+    return hash_pin(pin) == str(hashed)
+
+def configured():
+    return all(k in st.secrets for k in [
+        "APPS_SCRIPT_URL", "API_SECRET", "ADMIN_EMAIL", "ADMIN_PIN"
+    ])
+
+@st.cache_resource(show_spinner=False)
+def http_session():
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json"})
+    return session
+
+DATA_TTL_SECONDS = 45
+
+@st.cache_resource(show_spinner=False)
+def local_table_cache():
+    # Cache compartido por el proceso de Streamlit. Las escrituras de la app
+    # actualizan/invalidad este cache inmediatamente.
+    return {"data": {}, "ts": {}}
+
+def api_call(action, table=None, rows=None, timeout=12, retries=1):
+    payload = {
+        "secret": st.secrets["API_SECRET"],
+        "action": action,
+    }
+    if table is not None:
+        payload["table"] = table
+    if rows is not None:
+        payload["rows"] = rows
+
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = http_session().post(
+                st.secrets["APPS_SCRIPT_URL"],
+                json=payload,
+                timeout=(4, timeout if attempt == 0 else max(timeout, 18)),
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                raise RuntimeError(data.get("error", "Error de Apps Script"))
+            return data
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(0.35)
+                continue
+            raise
+    raise last_error
+
+def _normalize_table(name, rows):
+    if not rows:
+        return pd.DataFrame(columns=TABLES[name])
+    df = pd.DataFrame(rows)
+    for c in TABLES[name]:
+        if c not in df.columns:
+            df[c] = ""
+    return df[TABLES[name]].fillna("")
+
+def read_table(name, fresh=False):
+    store = local_table_cache()
+    now = time.monotonic()
+    cached = store["data"].get(name)
+    age = now - store["ts"].get(name, 0) if cached is not None else 10**9
+
+    if not fresh and cached is not None and age < DATA_TTL_SECONDS:
+        return cached.copy()
+
+    try:
+        rows = api_call("read", table=name, timeout=10, retries=1)["data"]["rows"]
+        df = _normalize_table(name, rows)
+        store["data"][name] = df.copy()
+        store["ts"][name] = time.monotonic()
+        return df.copy()
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        # Si Apps Script está lento, no tumbamos toda la aplicación: usamos
+        # el último dato válido que ya estaba cargado.
+        if cached is not None:
+            st.toast(f"Google tardó en responder. Mostrando la última copia de {name}.", icon="⚠️")
+            return cached.copy()
+        st.error(
+            "Google Sheets está tardando demasiado en responder. "
+            "No se perdió información. Espera unos segundos y pulsa ‘Actualizar datos’."
+        )
+        st.stop()
+    except Exception:
+        if cached is not None:
+            return cached.copy()
+        raise
+
+def invalidate_data_cache(name=None):
+    store = local_table_cache()
+    if name is None:
+        store["data"].clear()
+        store["ts"].clear()
+    else:
+        store["data"].pop(name, None)
+        store["ts"].pop(name, None)
+
+def write_table(name, df):
+    headers = TABLES[name]
+    clean = df.copy()
+    for c in headers:
+        if c not in clean.columns:
+            clean[c] = ""
+    clean = clean[headers].fillna("").astype(str)
+    # replace es idempotente; un reintento es seguro si hubo timeout.
+    api_call("replace", table=name, rows=clean.to_dict("records"), timeout=18, retries=1)
+    store = local_table_cache()
+    store["data"][name] = clean.copy()
+    store["ts"][name] = time.monotonic()
+
+def append_rows(name, rows):
+    if not rows:
+        return
+    headers = TABLES[name]
+    prepared = []
+    for row in rows:
+        if isinstance(row, dict):
+            prepared.append({h: str(row.get(h, "")) for h in headers})
+        else:
+            prepared.append({h: str(v) for h, v in zip(headers, row)})
+    # append NO se reintenta automáticamente para evitar duplicados.
+    api_call("append", table=name, rows=prepared, timeout=18, retries=0)
+    invalidate_data_cache(name)
+
+def next_student_id(df):
+    if df.empty:
+        return 1
+    nums = pd.to_numeric(df["No_Control"], errors="coerce")
+    return int(nums.max()) + 1 if nums.notna().any() else 1
+
+def log_movement(before, after, movement_type, motivo="", observaciones="", usuario=""):
+    row = [
+        "MOV-" + uuid.uuid4().hex[:12].upper(),
+        dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        str(after.get("No_Control","")),
+        str(after.get("Nombre","")),
+        movement_type,
+        str(before.get("Estado_Alumno","")),
+        str(after.get("Estado_Alumno","")),
+        str(before.get("Maestro","")),
+        str(after.get("Maestro","")),
+        str(before.get("Modulo","")),
+        str(after.get("Modulo","")),
+        str(before.get("Modalidad","")),
+        str(after.get("Modalidad","")),
+        str(motivo),
+        str(observaciones),
+        str(usuario),
+    ]
+    append_rows("HistorialAcademico", [row])
+
+@st.cache_resource(show_spinner=False)
+def bootstrap():
+    # La base ya fue inicializada. En arranque solo verificamos el puente;
+    # evitamos 4-5 lecturas completas que hacían lento cada cold start.
+    api_call("ping", timeout=8, retries=1)
+    return True
+
+def current_user():
+    return st.session_state.get("user")
+
+def user_roles(user=None):
+    u = user or current_user()
+    if not u:
+        return []
+    raw = str(u.get("Rol", "")).strip()
+    roles = []
+    for part in re.split(r"[,;/|]+", raw):
+        role = part.strip()
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+def active_role():
+    roles = user_roles()
+    selected = st.session_state.get("active_role")
+    if selected in roles:
+        return selected
+    if "Administrador" in roles:
+        return "Administrador"
+    if "Maestro" in roles:
+        return "Maestro"
+    if roles:
+        return roles[0]
+    return ""
+
+def is_admin():
+    return active_role() == "Administrador"
+
+def is_teacher():
+    return active_role() == "Maestro"
+
+def is_student():
+    return active_role() == "Alumno"
+
+def logout():
+    st.session_state.pop("user", None)
+    st.session_state.pop("active_role", None)
+    st.rerun()
+
+def safe_student_scope(df):
+    """Aplica aislamiento de datos según el rol activo."""
+    u = current_user()
+    role = active_role()
+    if not u:
+        return df.iloc[0:0]
+
+    if role in ["Administrador", "Consulta"]:
+        return df
+
+    if role == "Maestro":
+        teacher = str(u.get("Maestro","")).strip()
+        return df[df["Maestro"].astype(str) == teacher].copy()
+
+    if role == "Alumno":
+        control = str(u.get("No_Control","")).strip()
+        return df[df["No_Control"].astype(str) == control].copy()
+
+    return df.iloc[0:0]
+
+# =========================================================
+# REGISTRO PÚBLICO
+# =========================================================
+def public_registration_page():
+    st.markdown('<div class="main-header">📝 Registro de Alumno</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-header">Casa de Fe Mérida · Registro inicial para Escuelas</div>',
+        unsafe_allow_html=True
+    )
+    st.info(
+        "Tu registro ingresará automáticamente al sistema como **Pendiente de asignación**. "
+        "Después la coordinación te asignará maestro, módulo y modalidad."
+    )
+
+    with st.form("public_registration"):
+        nombre = st.text_input("Nombre completo *")
+        c1, c2 = st.columns(2)
+        celular = c1.text_input("Celular *")
+        email = c2.text_input("Correo electrónico *")
+        c3, c4 = st.columns(2)
+        sexo = c3.selectbox("Sexo", ["","Hombre","Mujer","Prefiero no indicar"])
+        fecha_nac = c4.date_input(
+            "Fecha de nacimiento (opcional)",
+            value=None,
+            min_value=dt.date(1940,1,1),
+            max_value=dt.date.today()
+        )
+        red = st.selectbox(
+            "Red / grupo de referencia",
+            ["","Matrimonios","Jóvenes","Prejuveniles","Otro"]
+        )
+        pin = st.text_input(
+            "Crea un PIN de acceso (mínimo 6 caracteres) *",
+            type="password",
+            help="Después podrás entrar como alumno para consultar únicamente tu propia información."
+        )
+        observ = st.text_area("Comentario u observación (opcional)")
+        acepta = st.checkbox(
+            "Confirmo que los datos proporcionados son correctos y autorizo su uso "
+            "para la gestión de las Escuelas Casa de Fe."
+        )
+        submit = st.form_submit_button("Enviar registro", type="primary")
+
+    if submit:
+        if not nombre.strip() or not celular.strip() or not email.strip():
+            st.error("Nombre, celular y correo son obligatorios.")
+            return
+        if len(pin) < 6:
+            st.error("El PIN debe tener al menos 6 caracteres.")
+            return
+        if not acepta:
+            st.error("Debes confirmar la autorización para continuar.")
+            return
+
+        alumnos = read_table("Alumnos", fresh=True)
+        usuarios = read_table("Usuarios", fresh=True)
+
+        phone_norm = re.sub(r"\D","",celular)
+        email_norm = normalize_email(email)
+
+        dup_phone = alumnos["Celular"].astype(str).str.replace(r"\D","",regex=True) == phone_norm
+        dup_email = alumnos["Email"].astype(str).str.lower().str.strip() == email_norm
+        if (dup_phone | dup_email).any():
+            st.warning(
+                "Ya existe un registro con ese celular o correo. "
+                "Comunícate con coordinación para evitar duplicados."
+            )
+            return
+
+        if email_norm in usuarios["Email"].astype(str).str.lower().tolist():
+            st.warning("Ese correo ya tiene acceso al sistema.")
+            return
+
+        nid = next_student_id(alumnos)
+        student = {
+            "No_Control": str(nid),
+            "Nombre": nombre.strip(),
+            "Sexo": sexo,
+            "Fecha_Nacimiento": str(fecha_nac) if fecha_nac else "",
+            "Celular": celular.strip(),
+            "Email": email_norm,
+            "Red": red,
+            "Maestro": "",
+            "Modulo": "",
+            "Modalidad": "",
+            "Estado_Alumno": "Pendiente de asignación",
+            "Fecha_Registro": str(dt.date.today()),
+            "Origen_Registro": "Registro público",
+            "Encuentro": "No",
+            "Pasos12": "",
+            "Liberacion": "No",
+            "Esencia_B1": "",
+            "Esencia_B2": "",
+            "Esencia_B3": "",
+            "Lanzamiento": "No",
+            "Fechas_Eventos": observ.strip(),
+            "Activo": "Sí",
+        }
+
+        alumnos = pd.concat([alumnos, pd.DataFrame([student])], ignore_index=True)
+        write_table("Alumnos", alumnos)
+
+        usuarios = pd.concat([usuarios, pd.DataFrame([{
+            "Email": email_norm,
+            "Nombre": nombre.strip(),
+            "Rol": "Alumno",
+            "Maestro": "",
+            "No_Control": str(nid),
+            "PIN_Hash": hash_pin(pin),
+            "Activo": "Sí",
+        }])], ignore_index=True)
+        write_table("Usuarios", usuarios)
+
+        log_movement(
+            {}, student, "Registro público",
+            motivo="Alta inicial",
+            observaciones=observ.strip(),
+            usuario=email_norm
+        )
+
+        st.success(
+            f"✅ Registro recibido. Tu número de control es **{nid}**. "
+            "Ya puedes entrar al portal con tu correo y PIN."
+        )
+        st.caption(
+            "Mientras coordinación realiza la asignación, tu portal mostrará únicamente "
+            "tu estado como Pendiente de asignación."
+        )
+
+# =========================================================
+# CONFIGURACIÓN / INICIALIZACIÓN
+# =========================================================
+st.sidebar.image("https://img.icons8.com/color/96/church.png", width=64)
+st.sidebar.title("Casa de Fe Mérida")
+st.sidebar.caption("Portal de Gestión Escolar")
+
+if not configured():
+    st.error("⚙️ Falta configurar la conexión con Google Apps Script en Streamlit Secrets.")
+    st.markdown("""
+En **Streamlit → App → Settings → Secrets** agrega:
+
+```toml
+APPS_SCRIPT_URL = "TU_URL_TERMINADA_EN_/exec"
+API_SECRET = "LA_MISMA_CLAVE_PRIVADA_DEL_APPS_SCRIPT"
+ADMIN_EMAIL = "tu-correo@ejemplo.com"
+ADMIN_PIN = "un-pin-inicial-seguro"
+```
+""")
+    st.stop()
+
+try:
+    bootstrap()
+except Exception as e:
+    st.error("No pude conectarme a Google Sheets mediante Apps Script.")
+    st.exception(e)
+    st.stop()
+
+# Link público: https://TU-APP.streamlit.app/?registro=1
+if str(st.query_params.get("registro","")) == "1":
+    public_registration_page()
+    st.stop()
+
+# =========================================================
+# LOGIN
+# =========================================================
+if "user" not in st.session_state:
+    st.markdown('<div class="main-header">⛪ Casa de Fe Mérida</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Portal de Escuelas</div>', unsafe_allow_html=True)
+
+    with st.form("login"):
+        email = st.text_input("Correo electrónico")
+        pin = st.text_input("PIN", type="password")
+        btn = st.form_submit_button("Ingresar", type="primary")
+
+    if btn:
+        usuarios = read_table("Usuarios", fresh=True)
+        usuarios["Email_norm"] = usuarios["Email"].astype(str).str.lower().str.strip()
+        hit = usuarios[usuarios["Email_norm"] == normalize_email(email)]
+        if hit.empty:
+            st.error("Usuario no autorizado.")
+        else:
+            row = hit.iloc[0].to_dict()
+            if not yes(row.get("Activo")):
+                st.error("Este usuario está desactivado.")
+            elif check_pin(pin, row.get("PIN_Hash")):
+                row.pop("Email_norm", None)
+                st.session_state.user = row
+                roles = user_roles(row)
+                if "Administrador" in roles:
+                    st.session_state.active_role = "Administrador"
+                elif "Maestro" in roles:
+                    st.session_state.active_role = "Maestro"
+                elif roles:
+                    st.session_state.active_role = roles[0]
+                st.rerun()
+            else:
+                st.error("PIN incorrecto.")
+    st.caption("Los alumnos nuevos deben usar el enlace de registro proporcionado por coordinación.")
+    st.stop()
+
+user = current_user()
+roles = user_roles(user)
+if len(roles) > 1:
+    current = active_role()
+    idx = roles.index(current) if current in roles else 0
+    selected_role = st.sidebar.selectbox("Ver portal como", roles, index=idx, key="role_switcher")
+    if selected_role != active_role():
+        st.session_state.active_role = selected_role
+        st.rerun()
+elif roles:
+    st.session_state.active_role = roles[0]
+
+st.sidebar.success(f"{user['Nombre']} · {active_role()}")
+if st.sidebar.button("🔄 Actualizar datos", help="Descarta la copia local y consulta de nuevo Google Sheets"):
+    invalidate_data_cache()
+    st.rerun()
+if is_teacher() and user.get("Maestro"):
+    st.sidebar.caption(f"Maestro: {user['Maestro']}")
+if is_student() and user.get("No_Control"):
+    st.sidebar.caption(f"No. Control: {user['No_Control']}")
+if st.sidebar.button("Cerrar sesión"):
+    logout()
+
+# =========================================================
+# MENÚ POR ROL (aislamiento estricto)
+# =========================================================
+if is_admin():
+    menu = [
+        "🏠 Inicio",
+        "📝 Pase de Lista",
+        "👤 Expedientes",
+        "👨‍🏫 Maestros y Asignaciones",
+        "🔐 Usuarios y Permisos",
+        "🎓 Cursos y Materiales",
+        "📜 Historial de Asistencia",
+        "🧾 Historial Académico",
+    ]
+elif is_teacher():
+    menu = [
+        "🏠 Mi grupo",
+        "📝 Pase de Lista",
+        "👤 Mis alumnos",
+        "🎓 Material de mi módulo",
+        "📜 Mi historial de asistencia",
+    ]
+elif is_student():
+    menu = [
+        "🏠 Mi perfil",
+        "📚 Mi módulo y material",
+        "📜 Mi asistencia",
+    ]
+else:  # Consulta
+    menu = [
+        "🏠 Inicio",
+        "👤 Expedientes",
+        "🎓 Cursos y Materiales",
+        "📜 Historial de Asistencia",
+    ]
+
+opcion = st.sidebar.radio("Navegación", menu)
+
+# =========================================================
+# ADMIN / CONSULTA: INICIO
+# =========================================================
+if opcion == "🏠 Inicio":
+    st.markdown('<div class="main-header">📊 Panel General</div>', unsafe_allow_html=True)
+    alumnos = read_table("Alumnos")
+    maestros = read_table("Maestros")
+    asist = read_table("Asistencias")
+
+    act = alumnos[alumnos["Activo"].apply(yes)] if not alumnos.empty else alumnos
+    mact = maestros[maestros["Activo"].apply(yes)] if not maestros.empty else maestros
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("Alumnos activos", len(act))
+    c2.metric("Maestros activos", len(mact))
+    c3.metric("Sin maestro", int((act["Maestro"].astype(str).str.strip()=="").sum()) if not act.empty else 0)
+    c4.metric("Pendientes", int((act["Estado_Alumno"].astype(str)=="Pendiente de asignación").sum()) if not act.empty else 0)
+    c5.metric("Asistencias registradas", len(asist))
+
+    a,b = st.columns(2)
+    with a:
+        st.subheader("Por módulo")
+        if not act.empty:
+            st.bar_chart(act["Modulo"].replace("", "Sin asignar").value_counts())
+    with b:
+        st.subheader("Por red")
+        if not act.empty:
+            st.bar_chart(act["Red"].replace("", "Sin red").value_counts())
+
+# =========================================================
+# MAESTRO: MI GRUPO
+# =========================================================
+elif opcion == "🏠 Mi grupo":
+    st.markdown('<div class="main-header">👨‍🏫 Mi grupo</div>', unsafe_allow_html=True)
+    alumnos = safe_student_scope(read_table("Alumnos"))
+    alumnos = alumnos[alumnos["Activo"].apply(yes)]
+    st.metric("Alumnos asignados", len(alumnos))
+    if alumnos.empty:
+        st.info("No tienes alumnos asignados actualmente.")
+    else:
+        st.dataframe(
+            alumnos[["No_Control","Nombre","Modulo","Modalidad","Estado_Alumno"]],
+            use_container_width=True, hide_index=True
+        )
+    st.caption("No puedes consultar alumnos, métricas o grupos de otros maestros.")
+
+# =========================================================
+# ALUMNO: MI PERFIL
+# =========================================================
+elif opcion == "🏠 Mi perfil":
+    st.markdown('<div class="main-header">👤 Mi perfil</div>', unsafe_allow_html=True)
+    alumnos = safe_student_scope(read_table("Alumnos"))
+    if alumnos.empty:
+        st.error("No encontramos un expediente vinculado a tu usuario.")
+        st.stop()
+    a = alumnos.iloc[0]
+
+    st.markdown(f"""
+    <div class="card">
+      <h3>{a['Nombre']}</h3>
+      <b>No. Control:</b> {a['No_Control']}<br>
+      <b>Estado:</b> {a['Estado_Alumno']}<br>
+      <b>Red:</b> {a['Red'] or 'Pendiente'}<br>
+      <b>Maestro:</b> {a['Maestro'] or 'Pendiente de asignación'}<br>
+      <b>Módulo:</b> {a['Modulo'] or 'Pendiente de asignación'}<br>
+      <b>Modalidad:</b> {a['Modalidad'] or 'Pendiente de asignación'}
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.subheader("Mi ruta")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Encuentro", a["Encuentro"] or "—")
+    c2.metric("12 Pasos", a["Pasos12"] or "—")
+    c3.metric("Liberación", a["Liberacion"] or "—")
+    c4.metric("Lanzamiento", a["Lanzamiento"] or "—")
+    st.caption("Tu cuenta únicamente permite consultar tu propio expediente y contenido asignado.")
+
+# =========================================================
+# PASE DE LISTA
+# =========================================================
+elif opcion == "📝 Pase de Lista":
+    st.markdown('<div class="main-header">📝 Pase de Lista</div>', unsafe_allow_html=True)
+    alumnos = read_table("Alumnos")
+    alumnos = alumnos[alumnos["Activo"].apply(yes)].copy()
+
+    if is_teacher():
+        maestro_sel = str(user.get("Maestro","")).strip()
+        if not maestro_sel:
+            st.error("Tu usuario no está vinculado a un maestro.")
+            st.stop()
+        st.info(f"Maestro: **{maestro_sel}**")
+    elif is_admin():
+        maestros = read_table("Maestros")
+        names = maestros[maestros["Activo"].apply(yes)]["Nombre"].astype(str).tolist()
+        maestro_sel = st.selectbox("Maestro", names)
+    else:
+        st.error("No tienes permiso para pasar lista.")
+        st.stop()
+
+    grupo = alumnos[alumnos["Maestro"].astype(str) == maestro_sel].copy()
+    modulos = sorted([x for x in grupo["Modulo"].astype(str).unique().tolist() if x.strip()])
+    if not modulos:
+        st.warning("No hay módulos asignados a este maestro.")
+        st.stop()
+
+    c1,c2 = st.columns(2)
+    modulo = c1.selectbox("Módulo", modulos)
+    fecha = c2.date_input("Fecha", dt.date.today())
+
+    lista = grupo[grupo["Modulo"].astype(str)==modulo]
+    editor = pd.DataFrame({
+        "No_Control": lista["No_Control"].astype(str),
+        "Alumno": lista["Nombre"].astype(str),
+        "Asistencia": [True]*len(lista),
+        "Observaciones": [""]*len(lista),
+    })
+
+    edited = st.data_editor(
+        editor, hide_index=True, use_container_width=True,
+        disabled=["No_Control","Alumno"],
+        column_config={
+            "Asistencia": st.column_config.CheckboxColumn("Presente"),
+            "Observaciones": st.column_config.TextColumn("Observaciones"),
+        }
+    )
+
+    if st.button("💾 Guardar asistencia", type="primary"):
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
+        for _,r in edited.iterrows():
+            rows.append([
+                now,str(fecha),maestro_sel,modulo,str(r["No_Control"]),str(r["Alumno"]),
+                "Presente" if bool(r["Asistencia"]) else "Ausente",
+                str(r["Observaciones"]),str(user["Email"])
+            ])
+        append_rows("Asistencias", rows)
+        st.success(f"✅ Se guardaron {len(rows)} registros.")
+
+# =========================================================
+# EXPEDIENTES ADMIN / CONSULTA / MAESTRO
+# =========================================================
+elif opcion in ["👤 Expedientes","👤 Mis alumnos"]:
+    title = "👤 Mis alumnos" if is_teacher() else "👤 Expedientes"
+    st.markdown(f'<div class="main-header">{title}</div>', unsafe_allow_html=True)
+
+    alumnos = safe_student_scope(read_table("Alumnos"))
+    if is_teacher():
+        alumnos = alumnos[alumnos["Activo"].apply(yes)]
+
+    if alumnos.empty:
+        st.info("No hay alumnos disponibles.")
+        st.stop()
+
+    nombre = st.selectbox("Alumno", sorted(alumnos["Nombre"].astype(str).tolist()))
+    a = alumnos[alumnos["Nombre"].astype(str)==nombre].iloc[0]
+
+    st.markdown(f"""
+    <div class="card">
+      <h3>{a['Nombre']}</h3>
+      <b>No. Control:</b> {a['No_Control']} |
+      <b>Estado:</b> {a['Estado_Alumno']} |
+      <b>Red:</b> {a['Red']}<br>
+      <b>Maestro:</b> {a['Maestro'] or 'Sin asignar'} |
+      <b>Módulo:</b> {a['Modulo'] or 'Sin asignar'} |
+      <b>Modalidad:</b> {a['Modalidad'] or 'Sin asignar'}
+    </div>
+    """, unsafe_allow_html=True)
+
+    if is_teacher():
+        st.caption("Vista de consulta. No puedes editar expedientes ni ver alumnos de otros maestros.")
+
+    if is_admin():
+        maestros = read_table("Maestros")
+        active_teachers = [""] + maestros[maestros["Activo"].apply(yes)]["Nombre"].astype(str).tolist()
+
+        st.subheader("✏️ Edición administrativa")
+        with st.form("edit_student"):
+            c1,c2,c3 = st.columns(3)
+            red = c1.text_input("Red", value=str(a["Red"]))
+            maestro = c2.selectbox(
+                "Maestro", active_teachers,
+                index=active_teachers.index(str(a["Maestro"])) if str(a["Maestro"]) in active_teachers else 0
+            )
+            modulo = c3.text_input("Módulo", value=str(a["Modulo"]))
+            modalidades = ["","PRESENCIAL","ONLINE"]
+            modalidad = c1.selectbox(
+                "Modalidad", modalidades,
+                index=modalidades.index(str(a["Modalidad"])) if str(a["Modalidad"]) in modalidades else 0
+            )
+            estados = [
+                "Pendiente de asignación","Activo","Baja temporal","Inactivo",
+                "Baja definitiva","Reingreso","Reinicio de módulo"
+            ]
+            estado_actual = str(a["Estado_Alumno"]) or "Activo"
+            estado = c2.selectbox(
+                "Estado", estados,
+                index=estados.index(estado_actual) if estado_actual in estados else 1
+            )
+            motivo = c3.text_input("Motivo del movimiento")
+            encuentro = c1.text_input("Encuentro", value=str(a["Encuentro"]))
+            pasos = c2.text_input("12 Pasos", value=str(a["Pasos12"]))
+            liber = c3.text_input("Liberación", value=str(a["Liberacion"]))
+            eb1 = c1.text_input("Esencia B1", value=str(a["Esencia_B1"]))
+            eb2 = c2.text_input("Esencia B2", value=str(a["Esencia_B2"]))
+            eb3 = c3.text_input("Esencia B3", value=str(a["Esencia_B3"]))
+            lanz = c1.text_input("Lanzamiento", value=str(a["Lanzamiento"]))
+            obs = c2.text_input("Observaciones")
+            save = st.form_submit_button("Guardar cambios", type="primary")
+
+        if save:
+            full = read_table("Alumnos")
+            mask = full["No_Control"].astype(str)==str(a["No_Control"])
+            before = full[mask].iloc[0].to_dict()
+
+            updates = {
+                "Red":red,"Maestro":maestro,"Modulo":modulo,"Modalidad":modalidad,
+                "Estado_Alumno":estado,"Encuentro":encuentro,"Pasos12":pasos,
+                "Liberacion":liber,"Esencia_B1":eb1,"Esencia_B2":eb2,
+                "Esencia_B3":eb3,"Lanzamiento":lanz
+            }
+            for k,v in updates.items():
+                full.loc[mask,k] = v
+            full.loc[mask,"Activo"] = "No" if estado in ["Inactivo","Baja definitiva"] else "Sí"
+            after = full[mask].iloc[0].to_dict()
+            write_table("Alumnos", full)
+
+            if any(str(before.get(k,"")) != str(after.get(k,"")) for k in [
+                "Estado_Alumno","Maestro","Modulo","Modalidad"
+            ]):
+                movement = "Actualización académica"
+                if estado == "Baja temporal": movement = "Baja temporal"
+                elif estado == "Baja definitiva": movement = "Baja definitiva"
+                elif estado == "Reingreso": movement = "Reingreso"
+                elif estado == "Reinicio de módulo": movement = "Reinicio de módulo"
+                elif str(before.get("Maestro","")) != str(after.get("Maestro","")): movement = "Cambio de maestro"
+                elif str(before.get("Modulo","")) != str(after.get("Modulo","")): movement = "Cambio de módulo"
+                log_movement(before, after, movement, motivo, obs, user["Email"])
+            st.success("Expediente actualizado.")
+            st.rerun()
+
+# =========================================================
+# ADMIN: MAESTROS / ASIGNACIONES / ALTAS
+# =========================================================
+elif opcion == "👨‍🏫 Maestros y Asignaciones":
+    if not is_admin():
+        st.error("Acceso restringido.")
+        st.stop()
+
+    st.markdown('<div class="main-header">👨‍🏫 Maestros y Asignaciones</div>', unsafe_allow_html=True)
+    admin_section = st.radio(
+        "Sección",
+        ["Maestros","Promover alumno a maestro","Asignación por curso","Nuevo alumno",
+         "Pendientes de asignación","Estados de alumnos"],
+        horizontal=True,
+        key="admin_teacher_section"
+    )
+
+    if admin_section == "Maestros":
+        maestros = read_table("Maestros")
+        st.dataframe(maestros, use_container_width=True, hide_index=True)
+
+        with st.form("new_teacher"):
+            st.subheader("Agregar maestro")
+            nombre = st.text_input("Nombre")
+            email = st.text_input("Correo")
+            red = st.text_input("Red")
+            add = st.form_submit_button("Agregar maestro", type="primary")
+        if add:
+            if not nombre.strip():
+                st.error("Escribe el nombre.")
+            else:
+                mid = f"M{len(maestros)+1:03d}"
+                maestros = pd.concat([maestros, pd.DataFrame([{
+                    "ID_Maestro":mid,"Nombre":nombre.strip(),"Email":normalize_email(email),
+                    "Red":red.strip(),"Activo":"Sí"
+                }])], ignore_index=True)
+                write_table("Maestros", maestros)
+                st.success("Maestro agregado.")
+                st.rerun()
+
+        if not maestros.empty:
+            st.subheader("Activar / desactivar maestro")
+            t = st.selectbox("Maestro", maestros["Nombre"].astype(str).tolist())
+            row = maestros[maestros["Nombre"].astype(str)==t].iloc[0]
+            est = st.radio("Estatus", ["Activo","Inactivo"], index=0 if yes(row["Activo"]) else 1, horizontal=True)
+            if st.button("Guardar estatus"):
+                maestros.loc[maestros["Nombre"].astype(str)==t,"Activo"] = "Sí" if est=="Activo" else "No"
+                write_table("Maestros", maestros)
+                st.success("Estatus actualizado.")
+                st.rerun()
+
+    elif admin_section == "Promover alumno a maestro":
+        st.subheader("Promover alumno a maestro")
+        st.caption("El alumno conserva su expediente y obtiene también el rol de Maestro. Después podrá cambiar entre vista Alumno y Maestro.")
+
+        alumnos = read_table("Alumnos")
+        usuarios = read_table("Usuarios")
+        maestros = read_table("Maestros")
+
+        alumno_options = {f"{r['No_Control']} · {r['Nombre']}": str(r["No_Control"]) for _, r in alumnos.iterrows()}
+        selected_label = st.selectbox("Alumno", list(alumno_options.keys()), key="promote_student") if alumno_options else None
+        red_default = ""
+        temp_pin = st.text_input("PIN temporal (solo se usa si el alumno todavía no tiene usuario)", type="password", key="promote_pin")
+
+        c1, c2 = st.columns(2)
+        promote = c1.button("⬆️ Promover a maestro", type="primary", use_container_width=True)
+        remove_teacher = c2.button("↩️ Quitar rol de maestro", use_container_width=True)
+
+        if selected_label:
+            sid = alumno_options[selected_label]
+            student_mask = alumnos["No_Control"].astype(str) == sid
+            student = alumnos[student_mask].iloc[0].to_dict()
+            student_name = str(student.get("Nombre", "")).strip()
+            student_email = normalize_email(student.get("Email", ""))
+
+            if promote:
+                # 1) Alta/activación en Maestros
+                teacher_match = maestros["Nombre"].astype(str).str.strip().str.lower() == student_name.lower()
+                if teacher_match.any():
+                    maestros.loc[teacher_match, "Activo"] = "Sí"
+                    if student_email:
+                        maestros.loc[teacher_match, "Email"] = student_email
+                    if str(student.get("Red", "")).strip():
+                        maestros.loc[teacher_match, "Red"] = str(student.get("Red", "")).strip()
+                else:
+                    nums = pd.to_numeric(maestros["ID_Maestro"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
+                    next_mid = int(nums.max()) + 1 if nums.notna().any() else len(maestros) + 1
+                    maestros = pd.concat([maestros, pd.DataFrame([{
+                        "ID_Maestro": f"M{next_mid:03d}",
+                        "Nombre": student_name,
+                        "Email": student_email,
+                        "Red": str(student.get("Red", "")).strip(),
+                        "Activo": "Sí",
+                    }])], ignore_index=True)
+                write_table("Maestros", maestros)
+
+                # 2) Actualizar usuario conservando Alumno + Maestro
+                user_mask = usuarios["No_Control"].astype(str) == sid
+                if not user_mask.any() and student_email:
+                    user_mask = usuarios["Email"].astype(str).str.lower().str.strip() == student_email
+
+                if user_mask.any():
+                    ui = usuarios[user_mask].index[0]
+                    roles_existing = [x.strip() for x in re.split(r"[,;/|]+", str(usuarios.at[ui, "Rol"])) if x.strip()]
+                    for role in ["Alumno", "Maestro"]:
+                        if role not in roles_existing:
+                            roles_existing.append(role)
+                    usuarios.at[ui, "Rol"] = ",".join(roles_existing)
+                    usuarios.at[ui, "Maestro"] = student_name
+                    usuarios.at[ui, "No_Control"] = sid
+                    usuarios.at[ui, "Activo"] = "Sí"
+                    if student_email:
+                        usuarios.at[ui, "Email"] = student_email
+                else:
+                    if not student_email:
+                        st.error("Este alumno no tiene correo. Agrégalo primero al expediente.")
+                        st.stop()
+                    if len(temp_pin) < 6:
+                        st.error("Este alumno no tiene usuario. Define un PIN temporal de al menos 6 caracteres.")
+                        st.stop()
+                    usuarios = pd.concat([usuarios, pd.DataFrame([{
+                        "Email": student_email,
+                        "Nombre": student_name,
+                        "Rol": "Alumno,Maestro",
+                        "Maestro": student_name,
+                        "No_Control": sid,
+                        "PIN_Hash": hash_pin(temp_pin),
+                        "Activo": "Sí",
+                    }])], ignore_index=True)
+                write_table("Usuarios", usuarios)
+                log_movement(student, student, "Promoción a maestro", "Alta de rol Maestro", "Conserva rol Alumno", user["Email"])
+                st.success(f"{student_name} ahora tiene roles Alumno y Maestro.")
+                st.rerun()
+
+            if remove_teacher:
+                user_mask = usuarios["No_Control"].astype(str) == sid
+                if not user_mask.any() and student_email:
+                    user_mask = usuarios["Email"].astype(str).str.lower().str.strip() == student_email
+                if user_mask.any():
+                    ui = usuarios[user_mask].index[0]
+                    roles_existing = [x.strip() for x in re.split(r"[,;/|]+", str(usuarios.at[ui, "Rol"])) if x.strip()]
+                    roles_existing = [r for r in roles_existing if r != "Maestro"]
+                    if "Alumno" not in roles_existing:
+                        roles_existing.insert(0, "Alumno")
+                    usuarios.at[ui, "Rol"] = ",".join(roles_existing)
+                    usuarios.at[ui, "Maestro"] = ""
+                    usuarios.at[ui, "No_Control"] = sid
+                    write_table("Usuarios", usuarios)
+
+                teacher_match = maestros["Nombre"].astype(str).str.strip().str.lower() == student_name.lower()
+                if teacher_match.any():
+                    maestros.loc[teacher_match, "Activo"] = "No"
+                    write_table("Maestros", maestros)
+
+                log_movement(student, student, "Baja de rol maestro", "Se retira rol Maestro", "Conserva rol Alumno", user["Email"])
+                st.success(f"Se retiró el rol Maestro de {student_name}; conserva su acceso como Alumno.")
+                st.rerun()
+
+    elif admin_section == "Asignación por curso":
+        st.subheader("📚 Asignación por curso")
+        st.caption(
+            "Selecciona primero el curso. Verás inmediatamente quién está asignado, "
+            "qué maestro tiene y podrás agregar, mover o cambiar alumnos sin editar Google Sheets."
+        )
+
+        alumnos = read_table("Alumnos")
+        maestros = read_table("Maestros")
+        materiales = read_table("Materiales")
+
+        active_teachers = maestros[maestros["Activo"].apply(yes)].copy()
+        teacher_names = active_teachers["Nombre"].astype(str).str.strip().tolist()
+
+        # Currícula base fija + cualquier módulo real que ya exista en la base/materiales.
+        curriculum_base = ["12 PASOS", "ESENCIA G8", "ESENCIA G9", "ESENCIA G10"]
+
+        discovered = []
+        if not alumnos.empty:
+            discovered += [
+                x.strip() for x in alumnos["Modulo"].astype(str).tolist()
+                if x.strip() and x.strip().lower() not in {"sin asignar", "nan"}
+            ]
+        if not materiales.empty:
+            discovered += [
+                x.strip() for x in materiales["Modulo"].astype(str).tolist()
+                if x.strip() and x.strip().lower() not in {"sin asignar", "nan"}
+            ]
+
+        cursos_fijos = []
+        for x in curriculum_base + discovered:
+            if x and x not in cursos_fijos:
+                cursos_fijos.append(x)
+
+        if not cursos_fijos:
+            st.warning("No hay cursos configurados.")
+            st.stop()
+
+        curso = st.selectbox(
+            "1. Selecciona el curso / módulo",
+            cursos_fijos,
+            key="curso_asignacion_admin"
+        )
+
+        actuales = alumnos[
+            alumnos["Modulo"].astype(str).str.strip() == curso
+        ].copy()
+
+        st.markdown(f"### 👥 Alumnos actualmente en {curso}")
+        if actuales.empty:
+            st.info("Este curso todavía no tiene alumnos asignados.")
+        else:
+            cols = ["No_Control", "Nombre", "Maestro", "Modalidad", "Red", "Estado_Alumno"]
+            st.dataframe(
+                actuales[cols],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            maestros_actuales = sorted([
+                x for x in actuales["Maestro"].astype(str).str.strip().unique().tolist()
+                if x
+            ])
+            if maestros_actuales:
+                st.caption("Maestro(s) actualmente registrados: " + ", ".join(maestros_actuales))
+            else:
+                st.caption("Actualmente este curso no tiene maestro asignado.")
+
+        st.divider()
+        st.markdown("### 👨‍🏫 Maestro del curso")
+
+        maestro_curso = st.selectbox(
+            "Maestro que atenderá este curso",
+            [""] + teacher_names,
+            key=f"teacher_for_{curso}"
+        )
+
+        modalidad_curso = st.selectbox(
+            "Modalidad",
+            ["Sin cambio", "PRESENCIAL", "ONLINE"],
+            key=f"mode_for_{curso}"
+        )
+
+        aplicar_existentes = st.checkbox(
+            "Aplicar este maestro también a TODOS los alumnos que ya están en este curso",
+            value=False,
+            key=f"apply_existing_{curso}"
+        )
+
+        st.divider()
+        st.markdown("### ➕ Agregar o mover alumnos a este curso")
+
+        candidatos = alumnos[
+            alumnos["Activo"].apply(yes)
+        ].copy()
+
+        # Mostramos primero a quienes todavía no están en el curso.
+        candidatos = candidatos[
+            candidatos["Modulo"].astype(str).str.strip() != curso
+        ]
+
+        candidate_options = {
+            f"{r['No_Control']} · {r['Nombre']} · "
+            f"{(str(r['Modulo']).strip() or 'Sin curso')} · "
+            f"{(str(r['Maestro']).strip() or 'Sin maestro')}": str(r["No_Control"])
+            for _, r in candidatos.iterrows()
+        }
+
+        selected_add = st.multiselect(
+            "Selecciona alumnos para agregar o mover a este curso",
+            list(candidate_options.keys()),
+            key=f"students_to_{curso}"
+        )
+
+        motivo_asignacion = st.text_input(
+            "Comentario / motivo (opcional)",
+            key=f"reason_course_{curso}"
+        )
+
+        if st.button(
+            f"💾 Guardar asignación en {curso}",
+            type="primary",
+            use_container_width=True,
+            key=f"save_course_{curso}"
+        ):
+            if not maestro_curso and not selected_add and not aplicar_existentes:
+                st.warning("Selecciona un maestro, alumnos o una acción antes de guardar.")
+            else:
+                ids_add = [candidate_options[x] for x in selected_add]
+                changed = 0
+
+                # Cambiar maestro/modalidad de todos los que ya pertenecen al curso.
+                if aplicar_existentes and not actuales.empty:
+                    for sid in actuales["No_Control"].astype(str).tolist():
+                        mask = alumnos["No_Control"].astype(str) == sid
+                        before = alumnos[mask].iloc[0].to_dict()
+
+                        if maestro_curso:
+                            alumnos.loc[mask, "Maestro"] = maestro_curso
+                        if modalidad_curso != "Sin cambio":
+                            alumnos.loc[mask, "Modalidad"] = modalidad_curso
+
+                        alumnos.loc[mask, "Estado_Alumno"] = "Activo"
+                        alumnos.loc[mask, "Activo"] = "Sí"
+
+                        after = alumnos[mask].iloc[0].to_dict()
+                        if before != after:
+                            log_movement(
+                                before, after,
+                                "Actualización de curso",
+                                motivo_asignacion or f"Actualización del grupo {curso}",
+                                "",
+                                user["Email"]
+                            )
+                            changed += 1
+
+                # Agregar/mover alumnos seleccionados al curso.
+                for sid in ids_add:
+                    mask = alumnos["No_Control"].astype(str) == sid
+                    before = alumnos[mask].iloc[0].to_dict()
+
+                    alumnos.loc[mask, "Modulo"] = curso
+                    if maestro_curso:
+                        alumnos.loc[mask, "Maestro"] = maestro_curso
+                    if modalidad_curso != "Sin cambio":
+                        alumnos.loc[mask, "Modalidad"] = modalidad_curso
+
+                    alumnos.loc[mask, "Estado_Alumno"] = "Activo"
+                    alumnos.loc[mask, "Activo"] = "Sí"
+
+                    after = alumnos[mask].iloc[0].to_dict()
+                    movement = (
+                        "Cambio de módulo"
+                        if str(before.get("Modulo", "")).strip()
+                        else "Asignación"
+                    )
+                    log_movement(
+                        before, after,
+                        movement,
+                        motivo_asignacion or f"Asignación al curso {curso}",
+                        "",
+                        user["Email"]
+                    )
+                    changed += 1
+
+                if changed:
+                    write_table("Alumnos", alumnos)
+                    st.success(
+                        f"✅ Se actualizaron {changed} asignación(es) en {curso}."
+                    )
+                    st.rerun()
+                else:
+                    st.info("No hubo cambios que guardar.")
+
+        st.divider()
+        st.markdown("### 🔄 Mover alumnos de este curso a otro")
+
+        if actuales.empty:
+            st.caption("No hay alumnos en este curso para mover.")
+        else:
+            current_options = {
+                f"{r['No_Control']} · {r['Nombre']}": str(r["No_Control"])
+                for _, r in actuales.iterrows()
+            }
+
+            selected_move = st.multiselect(
+                "Alumnos que cambiarán de curso",
+                list(current_options.keys()),
+                key=f"move_from_{curso}"
+            )
+
+            destinos = [x for x in cursos_fijos if x != curso]
+            destino = st.selectbox(
+                "Curso destino",
+                destinos,
+                key=f"destination_{curso}"
+            ) if destinos else ""
+
+            maestro_destino = st.selectbox(
+                "Maestro en el curso destino",
+                [""] + teacher_names,
+                key=f"destination_teacher_{curso}"
+            )
+
+            modalidad_destino = st.selectbox(
+                "Modalidad en el destino",
+                ["Sin cambio", "PRESENCIAL", "ONLINE"],
+                key=f"destination_mode_{curso}"
+            )
+
+            if st.button(
+                "➡️ Mover al curso seleccionado",
+                use_container_width=True,
+                key=f"move_course_btn_{curso}"
+            ):
+                if not selected_move:
+                    st.warning("Selecciona al menos un alumno.")
+                elif not destino:
+                    st.warning("Selecciona un curso destino.")
+                else:
+                    ids_move = [current_options[x] for x in selected_move]
+
+                    for sid in ids_move:
+                        mask = alumnos["No_Control"].astype(str) == sid
+                        before = alumnos[mask].iloc[0].to_dict()
+
+                        alumnos.loc[mask, "Modulo"] = destino
+                        if maestro_destino:
+                            alumnos.loc[mask, "Maestro"] = maestro_destino
+                        if modalidad_destino != "Sin cambio":
+                            alumnos.loc[mask, "Modalidad"] = modalidad_destino
+
+                        alumnos.loc[mask, "Estado_Alumno"] = "Activo"
+                        alumnos.loc[mask, "Activo"] = "Sí"
+
+                        after = alumnos[mask].iloc[0].to_dict()
+                        log_movement(
+                            before, after,
+                            "Cambio de módulo",
+                            f"Movimiento de {curso} a {destino}",
+                            "",
+                            user["Email"]
+                        )
+
+                    write_table("Alumnos", alumnos)
+                    st.success(
+                        f"✅ {len(ids_move)} alumno(s) movido(s) de {curso} a {destino}."
+                    )
+                    st.rerun()
+
+    elif admin_section == "Nuevo alumno":
+        alumnos = read_table("Alumnos")
+        maestros = read_table("Maestros")
+        teacher_names = [""] + maestros[maestros["Activo"].apply(yes)]["Nombre"].astype(str).tolist()
+
+        with st.form("new_student_admin"):
+            c1,c2,c3 = st.columns(3)
+            nombre = c1.text_input("Nombre completo")
+            sexo = c2.selectbox("Sexo", ["","Hombre","Mujer"])
+            celular = c3.text_input("Celular")
+            email = c1.text_input("Correo")
+            red = c2.text_input("Red")
+            maestro = c3.selectbox("Maestro", teacher_names)
+            modulo = c1.text_input("Módulo")
+            modalidad = c2.selectbox("Modalidad", ["","PRESENCIAL","ONLINE"])
+            add_student = st.form_submit_button("Agregar alumno", type="primary")
+
+        if add_student:
+            nid = next_student_id(alumnos)
+            student = {
+                "No_Control":str(nid),"Nombre":nombre.strip(),"Sexo":sexo,"Fecha_Nacimiento":"",
+                "Celular":celular.strip(),"Email":normalize_email(email),"Red":red.strip(),
+                "Maestro":maestro,"Modulo":modulo.strip(),"Modalidad":modalidad,
+                "Estado_Alumno":"Activo","Fecha_Registro":str(dt.date.today()),
+                "Origen_Registro":"Alta administrativa","Encuentro":"No","Pasos12":"",
+                "Liberacion":"No","Esencia_B1":"","Esencia_B2":"","Esencia_B3":"",
+                "Lanzamiento":"No","Fechas_Eventos":"","Activo":"Sí"
+            }
+            alumnos = pd.concat([alumnos, pd.DataFrame([student])], ignore_index=True)
+            write_table("Alumnos", alumnos)
+            log_movement({}, student, "Alta administrativa", "Nuevo alumno", "", user["Email"])
+            st.success(f"Alumno agregado con No. Control {nid}.")
+            st.rerun()
+
+    elif admin_section == "Pendientes de asignación":
+        alumnos = read_table("Alumnos")
+        pending = alumnos[alumnos["Estado_Alumno"].astype(str)=="Pendiente de asignación"]
+        if pending.empty:
+            st.success("No hay alumnos pendientes.")
+        else:
+            st.dataframe(
+                pending[["No_Control","Nombre","Celular","Email","Red","Fecha_Registro"]],
+                use_container_width=True, hide_index=True
+            )
+        st.info("Enlace público: agrega **?registro=1** al final de la URL de tu app.")
+
+    elif admin_section == "Estados de alumnos":
+        alumnos = read_table("Alumnos")
+        estado = st.selectbox(
+            "Filtrar por estado",
+            ["Todos","Activo","Pendiente de asignación","Baja temporal","Inactivo","Baja definitiva","Reingreso","Reinicio de módulo"]
+        )
+        view = alumnos if estado=="Todos" else alumnos[alumnos["Estado_Alumno"].astype(str)==estado]
+        st.dataframe(
+            view[["No_Control","Nombre","Estado_Alumno","Maestro","Modulo","Modalidad","Activo"]],
+            use_container_width=True, hide_index=True
+        )
+
+# =========================================================# ADMIN: USUARIOS Y PERMISOS
+# =========================================================
+elif opcion == "🔐 Usuarios y Permisos":
+    if not is_admin():
+        st.error("Acceso restringido.")
+        st.stop()
+
+    st.markdown('<div class="main-header">🔐 Usuarios y Permisos</div>', unsafe_allow_html=True)
+    usuarios = read_table("Usuarios")
+    st.dataframe(usuarios.drop(columns=["PIN_Hash"], errors="ignore"), use_container_width=True, hide_index=True)
+
+    maestros = read_table("Maestros")
+    alumnos = read_table("Alumnos")
+    teacher_names = [""] + maestros[maestros["Activo"].apply(yes)]["Nombre"].astype(str).tolist()
+    student_opts = [""] + [f"{r['No_Control']} · {r['Nombre']}" for _,r in alumnos.iterrows()]
+
+    with st.form("new_user"):
+        st.subheader("Crear usuario")
+        email = st.text_input("Correo")
+        nombre = st.text_input("Nombre")
+        rol = st.selectbox("Rol", ["Alumno","Maestro","Alumno,Maestro","Consulta","Administrador"])
+        maestro = st.selectbox("Vincular a maestro", teacher_names)
+        alumno_ref = st.selectbox("Vincular a alumno", student_opts)
+        pin = st.text_input("PIN inicial", type="password")
+        create = st.form_submit_button("Crear usuario", type="primary")
+
+    if create:
+        no_control = alumno_ref.split(" · ")[0] if alumno_ref else ""
+        email_n = normalize_email(email)
+        if not email_n or len(pin) < 6:
+            st.error("Correo y PIN (mínimo 6 caracteres) son obligatorios.")
+        elif email_n in usuarios["Email"].astype(str).str.lower().tolist():
+            st.error("Ese correo ya existe.")
+        else:
+            usuarios = pd.concat([usuarios, pd.DataFrame([{
+                "Email":email_n,"Nombre":nombre.strip(),"Rol":rol,
+                "Maestro":maestro if "Maestro" in rol else "",
+                "No_Control":no_control if "Alumno" in rol else "",
+                "PIN_Hash":hash_pin(pin),"Activo":"Sí"
+            }])], ignore_index=True)
+            write_table("Usuarios", usuarios)
+            st.success("Usuario creado.")
+            st.rerun()
+
+    if not usuarios.empty:
+        st.subheader("Activar / desactivar / cambiar PIN")
+        target = st.selectbox("Usuario", usuarios["Email"].astype(str).tolist())
+        row = usuarios[usuarios["Email"].astype(str)==target].iloc[0]
+        state = st.radio("Estatus", ["Activo","Inactivo"], index=0 if yes(row["Activo"]) else 1, horizontal=True)
+        new_pin = st.text_input("Nuevo PIN (opcional)", type="password")
+        if st.button("Guardar usuario"):
+            mask = usuarios["Email"].astype(str)==target
+            usuarios.loc[mask,"Activo"] = "Sí" if state=="Activo" else "No"
+            if new_pin:
+                usuarios.loc[mask,"PIN_Hash"] = hash_pin(new_pin)
+            write_table("Usuarios", usuarios)
+            st.success("Usuario actualizado.")
+            st.rerun()
+
+# =========================================================
+# CURSOS / MATERIALES ADMIN / CONSULTA
+# =========================================================
+elif opcion == "🎓 Cursos y Materiales":
+    st.markdown('<div class="main-header">🎓 Cursos y Materiales</div>', unsafe_allow_html=True)
+    cursos = read_table("Cursos")
+    materiales = read_table("Materiales")
+    active = cursos[cursos["Activo"].apply(yes)]
+
+    if not active.empty:
+        cmap = dict(zip(active["Nombre"].astype(str), active["Curso_ID"].astype(str)))
+        cname = st.selectbox("Curso", list(cmap.keys()))
+        cid = cmap[cname]
+        mats = materiales[
+            (materiales["Curso_ID"].astype(str)==cid) &
+            (materiales["Visible"].apply(yes))
+        ]
+        for _,m in mats.iterrows():
+            st.markdown(
+                f"""<div class="card"><b>{m['Modulo']} · {m['Titulo']}</b><br>
+                <span class="small-muted">{m['Descripcion']}</span><br><br>
+                <a href="{m['URL']}" target="_blank">📄 Abrir / descargar material</a></div>""",
+                unsafe_allow_html=True
+            )
+        if mats.empty:
+            st.info("Aún no hay materiales visibles.")
+
+    if is_admin():
+        st.divider()
+        course_admin_section = st.radio(
+            "Administrar", ["Nuevo curso","Agregar material"],
+            horizontal=True, key="course_admin_section"
+        )
+        if course_admin_section == "Nuevo curso":
+            with st.form("new_course"):
+                name = st.text_input("Nombre del curso")
+                desc = st.text_area("Descripción")
+                save = st.form_submit_button("Crear curso", type="primary")
+            if save:
                 cid = f"C{len(cursos)+1:03d}"
                 cursos = pd.concat([cursos,pd.DataFrame([{
                     "Curso_ID":cid,"Nombre":name.strip(),"Descripcion":desc.strip(),"Activo":"Sí"
@@ -126,3 +1533,8 @@ elif opcion == "🧾 Historial Académico":
         st.error("Acceso restringido.")
         st.stop()
     st.markdown('<div class="main-header">🧾 Historial Académico</div>', unsafe_allow_html=True)
+    hist = read_table("HistorialAcademico")
+    if hist.empty:
+        st.info("Aún no hay movimientos.")
+    else:
+        st.dataframe(hist.sort_values("Timestamp", ascending=False), use_container_width=True, hide_index=True)
