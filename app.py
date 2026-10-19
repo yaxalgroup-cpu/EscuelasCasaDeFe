@@ -1031,12 +1031,58 @@ elif opcion == "👨‍🏫 Maestros y Asignaciones":
         if actuales.empty:
             st.info("Este curso todavía no tiene alumnos asignados.")
         else:
-            cols = ["No_Control", "Nombre", "Maestro", "Modalidad", "Red", "Estado_Alumno"]
-            st.dataframe(
-                actuales[cols],
-                use_container_width=True,
-                hide_index=True
-            )
+            # Vista tipo tabla con acción rápida por alumno.
+            encabezados = st.columns([0.8, 2.3, 1.25, 1.15, 1.25, 1.25, 1.05])
+            encabezados[0].markdown("**No.**")
+            encabezados[1].markdown("**Nombre**")
+            encabezados[2].markdown("**Maestro**")
+            encabezados[3].markdown("**Modalidad**")
+            encabezados[4].markdown("**Red**")
+            encabezados[5].markdown("**Estado**")
+            encabezados[6].markdown("**Acción**")
+
+            for _, r in actuales.iterrows():
+                sid = str(r["No_Control"])
+                row_cols = st.columns([0.8, 2.3, 1.25, 1.15, 1.25, 1.25, 1.05])
+                row_cols[0].write(sid)
+                row_cols[1].write(str(r["Nombre"]))
+                row_cols[2].write(str(r["Maestro"]))
+                row_cols[3].write(str(r["Modalidad"]))
+                row_cols[4].write(str(r["Red"]))
+                row_cols[5].write(str(r["Estado_Alumno"]))
+
+                if row_cols[6].button(
+                    "Dar de baja",
+                    key=f"baja_curso_{curso}_{sid}",
+                    help="Quita al alumno de este curso sin borrar su expediente ni historial."
+                ):
+                    mask = alumnos["No_Control"].astype(str) == sid
+                    before = alumnos[mask].iloc[0].to_dict()
+
+                    # Baja solo del curso: conserva expediente, usuario e historial.
+                    alumnos.loc[mask, "Maestro"] = ""
+                    alumnos.loc[mask, "Modulo"] = ""
+                    alumnos.loc[mask, "Modalidad"] = ""
+                    alumnos.loc[mask, "Estado_Alumno"] = "Baja temporal"
+                    alumnos.loc[mask, "Activo"] = "Sí"
+
+                    after = alumnos[mask].iloc[0].to_dict()
+
+                    log_movement(
+                        before,
+                        after,
+                        "Baja de curso",
+                        f"Baja rápida del curso {curso}",
+                        "El alumno conserva expediente, historial y puede ser reasignado posteriormente.",
+                        user["Email"]
+                    )
+                    write_table("Alumnos", alumnos)
+
+                    st.success(
+                        f"✅ {r['Nombre']} fue dado de baja de {curso}. "
+                        "Su expediente e historial se conservaron."
+                    )
+                    st.rerun()
 
             maestros_actuales = sorted([
                 x for x in actuales["Maestro"].astype(str).str.strip().unique().tolist()
